@@ -1,106 +1,451 @@
-# Population-informed AIF estimation by empirical Bayes shrinkage
+# AIF error and Ktrans: a population-informed plan
 
-**Status:** design draft, 2026-11-20. Nothing here is implemented or validated yet.
-Results and decisions from testing this go in eLabFTW (team VELA), not in this file.
+**Status:** design draft v2, 2026-11-20. Supersedes v1 (commit `822e113`). It takes in the
+review in [population_aif_shrinkage_review.md](population_aif_shrinkage_review.md) and the PI's
+comments of 2026-11-20. Nothing here has been run on cohort data. The numbers in §3–§5 come from a
+noise-free simulation, [sims/aif_error_ktrans.py](sims/aif_error_ktrans.py), and depend on its
+assumptions (§3.2). Results and decisions from testing this go in eLabFTW (team VELA), not in this file.
 
-**Rendering:** equations use GitHub/KaTeX math (`$...$` inline, `$$...$$` display).
-They render on GitHub and in the VS Code Markdown preview (`Ctrl+Shift+V`).
-
----
-
-## 1. The idea in one paragraph
-
-When AutoAIF runs on a cohort, each subject's AIF is estimated on its own from a
-handful of voxels. Those estimates are noisy, especially in amplitude (partial
-volume, inflow, few voxels). But AIFs from the same population, same contrast
-agent and same protocol should look alike. Borrowing strength across subjects, as
-ComBat does across features, should cut that noise. Each subject's AIF is pulled
-toward the population average **in proportion to how unreliable it is**. Then we can
-use the population model again at the voxel level, so that among the voxels the
-network rates highly, we prefer the ones that fit a plausible AIF. Finally we
-iterate: re-estimate the population, re-shrink, re-select. This document puts that
-on a formal footing. It shows that the whole procedure is an EM algorithm for a
-three-level hierarchical model (voxel → subject → population), works out the
-shrinkage formulas, and points out one failure mode the naive iteration hits
-(collapse to the population mean) along with how to avoid it.
+**Rendering:** equations use GitHub/KaTeX math (`$...$` inline, `$$...$$` display). They render on
+GitHub and in the VS Code Markdown preview (`Ctrl+Shift+V`).
 
 ---
 
-## 2. Notation and what AutoAIF computes today
+## 0. What changed since v1
 
-| Symbol | Meaning |
-|---|---|
-| $s$ | site (scanner/protocol) |
-| $j = 1,\dots,J$ | subject (or session) |
-| $v$ | voxel |
-| $t = 1,\dots,T$ | time frame |
-| $y_{jv}(t)$ | signal of voxel $v$ in subject $j$ (later: relative enhancement or concentration) |
-| $m_{jv} \in [0,1]$ | soft mask value from the network for voxel $v$ |
-| $c_j(t)$ | true AIF of subject $j$ |
-| $\hat c_j(t)$ | estimated AIF |
+| v1 | v2 | Why |
+|---|---|---|
+| Goal: an AIF closer to the truth | Goal: accurate $K^{\text{trans}}$ (and $v_p$) per subject, and no added bias in group comparisons | PI: $K^{\text{trans}}$ is the outcome |
+| Shrink each subject's AIF toward the population | Estimate and correct each subject's **AIF error parameters**, the two numbers that actually move $K^{\text{trans}}$, and shrink *those* across subjects | Review §2: voxel scatter is not the error that matters. Shrinking a nuisance parameter is what ComBat actually does |
+| Reliability from voxel scatter | Reliability from **physical consistency checks** (vessel voxels, tissue fits) | Review §3: shared and subject-level errors are invisible in voxel scatter |
+| Voxel selection by agreement with the population | Candidate AIFs ranked by the $K^{\text{trans}}$-relevant checks | PI's tissue-fit idea (§5) |
+| Arterial vs venous discrimination, peak recovery | Backlog for a general tool | PI: hard to resolve at ~15 s; minor for $K^{\text{trans}}$. The simulation agrees for arterial vs venous but **not for peak errors** (§3.4) |
+| ComBat derivation and collapse analysis in the main text | Appendices A and B | Review §5.5 |
 
-The network (`model_vif.py`, `computeCurve`) outputs a soft mask and forms the
-AIF as the mask-weighted mean signal:
+The v1 voxel-mixture EM formulation (v1 §6–§8) is parked in the backlog (§8). It is still in the
+git history at `822e113`.
+
+---
+
+## 1. Target, regime and loss
+
+- **Outcome:** $K^{\text{trans}}$ in brain, mostly subtle blood–brain barrier leakage
+  ($K^{\text{trans}} \sim 0.5\text{–}3 \times 10^{-3}\ \text{min}^{-1}$, $v_p \sim 1\text{–}5\%$),
+  with $v_p$ secondary. Lesions with larger leakage are a secondary case.
+- **Data:** about 15 s temporal resolution, scans of roughly 8 min (to be confirmed per site),
+  several sites.
+- **Kinetic model:** Patlak for low-leakage brain, extended Tofts where leakage is larger.
+- **Loss:** per-subject error in $K^{\text{trans}}$, plus bias in group comparisons. AIF fidelity
+  matters only as far as it moves these.
+- **Out of scope for now:** flow and first-pass perfusion parameters, and telling arterial from
+  venous voxels.
+
+---
+
+## 2. Prerequisites in the current code
+
+These come from the review (§4.1) and need settling before any measurement means anything:
+
+1. **Name the baseline estimator.** The network's soft-weighted curve over the resampled volume, or
+   the top-20 hard mask applied to native data? Downstream fits presumably use the latter.
+2. **Bug:** [main_vif.py:93](../main_vif.py:93) tests `top20.all() > 0.9`, which checks the
+   *indices* returned by `argsort`, not mask values. It is true unless flat index 0 is in the top 20,
+   so the top-5 branch effectively never runs.
+3. **Time axis:** curves for kinetic fitting must come from the native frames. Preprocessing resamples
+   time to 32 frames with linear `zoom` ([utils_vif.py:42](../utils_vif.py:42)). That is fine for
+   finding voxels, not for the curve.
+4. **What $m_{jv}$ is:** the network is trained on the curve loss only and its output is min–max
+   normalized per subject, so $m_{jv}$ is a voxel ranking, not a calibrated probability.
+5. **Arterial or venous masks?** Whether the manual training masks include the sagittal sinus
+   decides which vessel checks in §5.5 are independent of the AIF.
+
+---
+
+## 3. Which AIF errors move Ktrans
+
+### 3.1 Model
+
+Patlak, for tissue voxel $v$ with plasma AIF $c(t)$:
 
 $$
-\hat c_j(t) = \frac{\sum_v m_{jv}\, y_{jv}(t)}{\sum_v m_{jv}}
+C_v(t) = v_{p,v}\, c(t) + K_v \int_0^t c(u)\, du
 $$
 
-At inference (`main_vif.py`, `inference_mode`) the mask is resampled back to native
-resolution, and the top-20 (or top-5) voxels by $m_{jv}$ are also saved as a hard mask.
-In both cases **each subject is estimated independently**. No information is shared
-across the cohort.
+Fitted by linear least squares on the sampled frames, with a subject-level delay. Extended Tofts
+replaces the integral with $\int_0^t c(u)\, e^{-k_{ep}(t-u)}\, du$.
 
-Two details matter later:
+### 3.2 Simulation setup
 
-- Training normalizes curves by their first frame (`y / y[:, 0]`), so the network
-  cares about **shape** rather than absolute scale.
-- Preprocessing resamples every series to $T = 32$ frames regardless of the real
-  temporal resolution. A population model has to work in **physical time** (seconds
-  from bolus arrival), not frame index (see §9.6).
+Parker population AIF (converted to plasma, Hct 0.42). 15 s frames (box-car average), 8 min,
+arrival at 60 s. Brain voxel: $v_p = 0.02$, $K^{\text{trans}} = 0.002\ \text{min}^{-1}$ (Patlak).
+Lesion voxel: $v_p = 0.03$, $K^{\text{trans}} = 0.05\ \text{min}^{-1}$, $v_e = 0.2$ (extended Tofts).
+Errors are applied to the AIF only. Tissue is sampled with the same frames, so undersampling
+alone is not an error. No noise. Changes are relative to the fit with the true AIF.
+
+### 3.3 Results
+
+| AIF error | Brain $\Delta K^{\text{trans}}$ | Brain $\Delta v_p$ | Lesion $\Delta K^{\text{trans}}$ | Lesion $\Delta v_p$ | Brain tissue-fit residual (% of tissue peak) |
+|---|---|---|---|---|---|
+| none | 0 | 0 | 0 | 0 | 0.05 |
+| scale ×0.8 (partial volume, $S_0$, $T_{10}$, Hct) | **+25%** | +25% | **+25%** | +25% | 0.05 |
+| first-pass area −30% | **−32%** | +28% | −4% | +65% | 3.20 |
+| peak saturation (peak −30%, nonlinear) | **−17%** | +23% | +10% | +27% | 1.93 |
+| delay +7.5 s (delay fitted) | +0.5% | +0.5% | +2.5% | −16% | 3.76 |
+| venous-like: 4 s delay + 4 s dispersion | −3.8% | +3.6% | +1.3% | −9% | 5.35 |
+| washout rate +30% | **+36%** | −1% | 0.1% | −0.4% | 0.13 |
+| tail level +10% after 2 min | **−15%** | 0.3% | 1.1% | 0.1% | 0.57 |
+
+### 3.4 What this says about the starting assumptions
+
+- **Arterial vs venous: supported.** Once a delay is fitted, a venous-like AIF moves
+  $K^{\text{trans}}$ by about 4% in brain and 1% in lesions.
+- **Peak errors only matter for flow: supported for lesions, not for subtle leakage.** In
+  low-leakage brain, a 30% loss of peak moves $K^{\text{trans}}$ by 17–32%. The mechanism is in §3.5.
+  Pure temporal undersampling is harmless, because tissue is sampled the same way. What hurts is
+  any **AIF-specific** distortion of the peak-to-tail ratio: $T_1$ saturation of the
+  signal-to-concentration conversion, $T_2^{\ast}$ loss at peak, and concentration-dependent inflow.
+- **Scale passes through one-to-one** in every case. It is the most common error (partial volume,
+  baseline, $T_{10}$, hematocrit) and the largest.
+- **Tail shape matters as much as scale in brain.** A 30% faster washout gives +36%, and a 10%
+  higher late tail gives −15%.
+
+So for subtle-leakage $K^{\text{trans}}$, the priority order is: **scale ≈ peak-to-tail and tail
+shape ≫ timing ≈ arterial vs venous.**
+
+### 3.5 Why low-leakage Ktrans is so sensitive: vp leverage
+
+Write the measured AIF as $\tilde c = c + \Delta$ and its integral as
+$\tilde I = I + L\Delta$, where $L$ is the integration operator. Let
+$\tilde X = [\tilde c,\ \tilde I]$ and $G = (\tilde X^\top \tilde X)^{-1}\tilde X^\top$.
+To first order:
+
+$$
+\frac{\Delta K}{K} \approx -\frac{v_p}{K}\,\big[G\,\Delta\big]_2 \;-\; \big[G\,L\,\Delta\big]_2
+$$
+
+The first term carries the factor $v_p/K^{\text{trans}}$. In brain that is about
+$0.02 / 0.002\ \text{min}^{-1} = 10$ min; in the lesion it is 0.6 min. Tissue signal in
+low-leakage brain is almost all $v_p\, c(t)$. $K^{\text{trans}}$ is a small slope on top of that,
+so any part of the AIF error that the fit cannot absorb into $v_p$ gets amplified into
+$K^{\text{trans}}$ by $v_p/K$. Longer scans reduce the leverage by giving the integral term more
+weight.
 
 ---
 
-## 3. How ComBat / neuroCombat works
+## 4. Exact result: an AIF error acts through one 2×2 matrix per subject
 
-References: Johnson, Li & Rabinovic (2007) for the method; Fortin et al. (2017,
-2018) for neuroCombat. The formulas below follow the neuroCombat code
-(`aprior`, `bprior`, `postmean`, `postvar`, `it_sol`).
+For Patlak with a fixed delay, the fit is linear in the tissue curve, and the true tissue curve is
+linear in $(v_p, K)$. For **any** measured AIF $\tilde c$, then, the fitted parameters of every
+voxel are an exact linear map of the true ones:
 
-### 3.1 The model
+$$
+\begin{pmatrix}\hat v_p \\ \hat K\end{pmatrix}
+= M(\tilde c)\begin{pmatrix} v_p \\ K\end{pmatrix},
+\qquad
+M(\tilde c) = (\tilde X^\top\tilde X)^{-1}\tilde X^\top\,[\,c,\ I\,]
+$$
 
-Index batch (site) $i$, sample (subject) $j$ within batch, feature $v$ (voxel,
-ROI, gene). ComBat assumes
+Without noise this is exact, not first order. (Simulation: $R^2 = 1.000000$ over 300 random
+voxels.) With noise, a zero-mean term is added. Writing it out:
+
+$$
+\hat K_v = m_{22}\, K_v + m_{21}\, v_{p,v},
+\qquad
+\hat v_{p,v} = m_{11}\, v_{p,v} + m_{12}\, K_v
+$$
+
+| AIF error | $m_{11}$ | $m_{12}$ (min) | $m_{21}$ (min⁻¹) | $m_{22}$ | $\rho = m_{21}/m_{11}$ |
+|---|---|---|---|---|---|
+| none | 1 | 0 | 0 | 1 | 0 |
+| scale ×0.8 | 1.250 | 0 | 0 | 1.250 | 0 |
+| first-pass area −30% | 1.266 | 0.162 | −0.0394 | 1.074 | −0.031 |
+| peak saturation −30% | 1.218 | 0.088 | −0.0262 | 1.090 | −0.022 |
+| washout +30% | 0.999 | −0.068 | +0.0264 | 1.094 | +0.026 |
+| tail level +10% | 1.000 | 0.036 | −0.0108 | 0.959 | −0.011 |
+
+What follows from this:
+
+1. **Within a subject, the AIF distorts the whole $K^{\text{trans}}$ map by a gain $m_{22}$ plus
+   an offset proportional to $v_p$, with slope $m_{21}$.** Three numbers per subject
+   ($m_{11}, m_{21}, m_{22}$; $m_{12}K$ is under 2% of $v_p$ here) describe the entire effect of
+   the AIF on $K^{\text{trans}}$ and $v_p$. We do not need the whole AIF to be right. We need these
+   numbers to be right, or known.
+2. **The leverage error $\rho = m_{21}/m_{11}$ is the dangerous one.** With
+   $m_{21} = -0.026\ \text{min}^{-1}$ (30% peak saturation) and $v_p = 0.02$, the offset is
+   $-5.2\times10^{-4}\ \text{min}^{-1}$, about a quarter of a typical subtle-leakage
+   $K^{\text{trans}}$ ($2\times10^{-3}$). It varies across voxels with $v_p$, so it also distorts regional contrasts
+   (gray vs white matter).
+3. **Scale errors give $M = s^{-1}\,\mathbb I$.** They leave $\rho = 0$ and multiply
+   $K^{\text{trans}}$ and $v_p$ alike. The ratio $K^{\text{trans}}/v_p$ does not depend on scale.
+4. **A correction formula.** Using $v_{p,v} \approx \hat v_{p,v}/m_{11}$:
+   $$
+   K_v \approx \frac{\hat K_v - \rho\, \hat v_{p,v}}{m_{22}}
+   $$
+   The $\rho$ part needs a shape anchor (§5.5). The $m_{22}$ part needs a scale anchor (§6.2).
+   For pure scale errors $m_{22} = m_{11}$. For the shape errors above, $m_{22}$ stays within 10%
+   of 1 while $m_{11}$ moves up to 27%. A scale anchor calibrated on $v_p$ therefore does not fully
+   fix $m_{22}$.
+5. **Extended Tofts** is nonlinear in $k_{ep}$, so $M$ is only a local linearization there. In
+   low-leakage brain Patlak is the operative model anyway, and in lesions the leverage is small
+   (Table §3.3).
+
+---
+
+## 5. The tissue-fit quality idea, analyzed
+
+### 5.1 The proposal
+
+Use each candidate AIF to fit tissue voxels, and score the candidate by fit quality. Tissue curves
+are less biased than vessel curves: tissue is stationary, has no inflow, and its concentrations are
+low enough to avoid saturation. Separately, look at the distribution of fitted parameters, since a
+distribution that disagrees with expectation points to AIF error.
+
+### 5.2 Formalization
+
+For candidate $\tilde c$, with $\tilde P$ the projection onto $\operatorname{span}\{\tilde c, \tilde I\}$:
+
+$$
+R(\tilde c) = \sum_v \frac{\lVert y_v - \tilde X\hat\theta_v\rVert^2}{\sigma_v^2},
+\qquad
+\mathbb E\,R(\tilde c) = \sum_v \left[(T-2) + \frac{\lVert (\mathbb I - \tilde P)\,[c,\ I]\,\theta_v\rVert^2}{\sigma_v^2}\right]
+$$
+
+The excess residual measures the part of the true tissue curve that falls **outside** the span
+generated by the candidate AIF. The $K^{\text{trans}}$ error is set by $M$, which is the projection
+**onto** that span. **The residual and the $K^{\text{trans}}$ error are complementary pieces of
+the same decomposition.** The residual cannot measure the $K^{\text{trans}}$ error in general.
+
+### 5.3 What the residual is blind to
+
+- **Scale:** exactly blind. $\tilde c = s\,c$ spans the same space.
+- **A "tail ramp" direction:** the error $\Delta$ solving $(v_p + K L)\,\Delta \propto I$. This
+  error grows with the running integral of the AIF. In the simulation it is +0.7% at 30 s, +1.5%
+  at 1 min, +2.6% at 2 min, +5% at 4 min and +9% at 7 min. It moves brain $K^{\text{trans}}$ by
+  **−9%**, and the fit is indistinguishable from the true AIF's (residual $5\times10^{-5}$ mM).
+  The direction depends only on the voxel's $K/v_p$ ratio, so pooling voxels with similar ratios
+  does not reveal it.
+- **Near-blind in practice:** washout rate (+36% in $K^{\text{trans}}$, residual 0.13% of the tissue
+  peak) and late tail level (−15%, residual 0.57%). These are close to the tail-ramp direction.
+
+### 5.4 What the residual does see
+
+Peak-shape distortions (first-pass −30%: 3.2%; saturation: 1.9%) and timing (3.8–5.4%, even
+after the delay fit, because shifting 15 s frames by interpolation is crude). At ROI level, with thousands of white-matter voxels, a 2–3% systematic misfit is
+measurable. Fit quality is therefore a good **detector of peak and timing problems and of gross
+failures**, but a poor **measure of $K^{\text{trans}}$ error**. Washout gives a +36% $K^{\text{trans}}$
+error with a smaller residual than a harmless half-frame delay.
+
+Good practice if we use it:
+
+- **Compare candidates paired on the same tissue.** Model inadequacy (Patlak vs a two-compartment
+  exchange model), drift and CSF partial volume are shared by all candidates and largely cancel in
+  $R(\tilde c_1) - R(\tilde c_2)$.
+- **Use ROI means** (white matter, cortical gray matter) rather than single voxels. Residuals are
+  correlated in time, and a white-noise likelihood over frames is overconfident (review §4.5).
+- **Cross-fit:** choose the AIF using one set of regions and report $K^{\text{trans}}$ on another, so
+  selection does not adapt to the outcome region's noise.
+
+### 5.5 The parameter-distribution half: this is where the Ktrans information is
+
+§4 says the AIF error shows up in the fitted parameters as $\hat K_v = m_{22}K_v + m_{21}v_{p,v}$.
+Two ways to read $\rho$ off a subject:
+
+**(a) Vessel voxels: a physical anchor.** A voxel fully or partly inside a large vessel has
+$K = 0$ (no leakage from the lumen) and $v_p = f$ (its blood fraction, in blood units). Fitted with
+the candidate AIF:
+
+$$
+\frac{\hat K_{\text{vessel}}}{\hat v_{p,\text{vessel}}} = \frac{m_{21} f}{m_{11} f} = \rho
+$$
+
+The ratio does not depend on the vessel voxel's partial volume $f$, or on hematocrit. Blood is well
+mixed after the first pass, so a vein is a valid probe: the AIF error is *read through* it, not
+added by it. In the simulation, the floor set by venous delay and dispersion is
+$\lvert\hat K_{\text{vessel}}\rvert \le 0.008\ \text{min}^{-1}$ with the correct AIF, against
+$-0.031\ \text{min}^{-1}$ for a 30% peak saturation. **The probe vessel must not be the voxels that
+built the AIF**, because fitting an AIF to its own curve returns $\rho = 0$ trivially. Use a
+different vessel (sagittal sinus vs an arterial AIF, or the reverse), or a held-out segment.
+
+**(b) Tissue $K$–$v_p$ slope: a biological anchor.** Across tissue voxels,
+$\hat K_v = m_{22}K_v + m_{21}v_{p,v}$, so regressing $\hat K$ on $\hat v_p$ gives
+$\rho$ plus any true $K$–$v_p$ correlation. This needs the assumption that true leakage is unrelated
+to blood volume, which may be false (more vessels, more surface). Use it as a cross-check on (a),
+not as the anchor.
+
+**Absolute values** (for example "white-matter $v_p$ should be about 2%") only inform scale (§6.2),
+and they assume the very quantity a study might be measuring.
+
+### 5.6 Relation to existing work
+
+The idea that tissue curves determine the AIF is **multichannel blind identification**
+(Riabkov & Di Bella 2002; Fluckiger et al. 2009; Schabel et al. 2010). Those papers show the AIF is
+recoverable from multiple tissue curves *up to scale*, which matches §5.3. §5.3 adds that for
+low-leakage Patlak there is a second near-blind direction, and that it is exactly the one that
+moves $K^{\text{trans}}$. Low-level BBB leakage work commonly uses a sagittal sinus input
+function, partly because it suffers less partial volume (for example Heye et al. 2016; Manning et
+al. 2021). The $\rho$
+check in §5.5(a) extends it from scale to shape.
+
+---
+
+## 6. Where the population (ComBat) idea fits now
+
+### 6.1 Shrink the error parameters, not the AIF
+
+Each subject $j$ has nuisance parameters $\phi_j = (\rho_j,\ \log s_j)$: leverage error and scale
+error. They come from the measurement chain (vessel geometry, slab position, saturation at that
+site's dose and sequence), so subjects at a site should resemble each other. They are also exactly
+what we want to **remove**. This is the ComBat setting proper (Appendix A): a noisy per-unit
+nuisance estimate, a shared prior across units, shrinkage, then removal. It answers the review's
+main objection: the uncertainty being shrunk is now the uncertainty of an anchor-based error
+estimate, not voxel scatter of the AIF.
+
+For the leverage error:
+
+$$
+\hat\rho_j \mid \rho_j \sim \mathcal N(\rho_j,\ \text{se}_j^2),
+\qquad
+\rho_j \sim \mathcal N(\bar\rho_{s(j)} + \mathbf z_j^\top\boldsymbol\beta,\ \tau_\rho^2)
+$$
+
+$$
+\rho^{\ast}_j = w_j\,\hat\rho_j + (1 - w_j)\,(\hat{\bar\rho}_{s(j)} + \mathbf z_j^\top\hat{\boldsymbol\beta}),
+\qquad
+w_j = \frac{\hat\tau_\rho^2}{\hat\tau_\rho^2 + \text{se}_j^2}
+$$
+
+- $\text{se}_j$ comes from bootstrapping over probe vessel voxels or segments, **plus** the
+  dispersion floor of §5.5 as a known variance term. That floor is shared and would otherwise be
+  ignored.
+- $\mathbf z_j$ are **measurement-quality covariates**: vessel diameter in voxels, slice position
+  of the vessel relative to the slab edge (inflow), dose, and sequence parameters. These are the
+  error-model covariates the review proposed (§3, item 3). They are not physiological covariates.
+- Subjects with no usable probe vessel get the site prediction: full shrinkage, $w_j = 0$.
+- If $\hat\tau_\rho^2 \to 0$, the error is site-level. A single per-site correction then suffices,
+  which is the simplest useful outcome.
+
+### 6.2 Scale: triple collocation
+
+Scale cannot be read from tissue fits (§5.3). It needs absolute anchors. Take three log-amplitude
+measurements per subject with independent errors, for example:
+
+- $X_1$: AutoAIF tail level;
+- $X_2$: $\hat v_p$ of the least-partial-volumed probe vessel voxels (sinus maximum), converted so
+  that a pure vessel reads 1;
+- $X_3$: plasma level predicted from dose per kg and a population biexponential (Weinmann 1984),
+  optionally adjusted for hematocrit and renal function.
+
+Model each as $X_{kj} = \alpha_k + A_j + e_{kj}$, with true log amplitude $A_j$. Across subjects,
+$\operatorname{Cov}(X_k, X_l) = \operatorname{Var}(A)$ for $k \ne l$, so every error variance is
+identifiable without ground truth:
+
+$$
+\operatorname{Var}(e_1) = \operatorname{Var}(X_1) - \frac{\operatorname{Cov}(X_1,X_2)\,\operatorname{Cov}(X_1,X_3)}{\operatorname{Cov}(X_2,X_3)}
+$$
+
+and likewise for $e_2$ and $e_3$ (Stoffelen 1998, with general linear calibration). The best
+combined amplitude weights each $X_k$ by $1/\operatorname{Var}(e_k)$. That is the empirical Bayes
+shrinkage for scale, with weights estimated rather than assumed. This is the review's
+tissue-regression idea (§3, item 1) made general.
+
+**Circularity rule:** anything used as an anchor cannot be an outcome. Physical anchors (vessel
+lumen, dose pharmacokinetics) come first. A white-matter $v_p$ anchor would partly normalize away
+real differences in white-matter $v_p$ between groups, so use it only when that is not a study
+question.
+
+### 6.3 Candidate AIFs: the PI's voxel-selection idea, re-aimed
+
+Generate candidate AIFs from the network ranking: top-$N$ for several $N$, connected components
+separately, artery vs sinus, and the site population AIF. Rank them by:
+
+1. $\lvert\hat\rho\rvert$ against an independent probe vessel (§5.5a). This is the
+   $K^{\text{trans}}$-relevant criterion.
+2. The paired tissue residual (§5.4), to catch peak and timing failures.
+3. The population-model likelihood (§7), to catch gross failures.
+
+Then apply the scale calibration (§6.2) to the chosen candidate. "Conform" now means agreeing with
+physical consistency checks, not with the population mean, which avoids the drift-toward-the-mean
+problem the review raised (§4.5).
+
+If iterating site-level hyperparameters with re-selection, the collapse safeguards of Appendix B
+apply: soft weights and posterior-variance terms in the variance update.
+
+---
+
+## 7. Population model as quality control
+
+This is unchanged in spirit from the review (§5.3): a per-site model of AIF tail shape, amplitude
+and timing, plus the distributions of $\hat\rho_j$ and the tissue residual. Subjects in the tails
+are flagged for review or fall back to the site population AIF with site-level $\rho$ and scale
+corrections. It has no feedback loop and is useful whatever happens to the rest.
+
+---
+
+## 8. Plan with gates
+
+| Gate | Work | Needs | Stop or redirect if |
+|---|---|---|---|
+| **0** | Prerequisites in §2: baseline estimator, fix main_vif.py:93, native-frame curves, concentration conversion, Patlak fitting (ROCKETSHIP or Python) | code only | n/a |
+| **1** | Re-run [the simulation](sims/aif_error_ktrans.py) with each site's real frame times, scan length, dose, and typical $v_p$, $K^{\text{trans}}$. Add realistic $T_1$ saturation for each site's sequence | protocol parameters, no subject data | Leverage $v_p/K$ is small at all sites: shape errors don't matter; go to Gate 3 only |
+| **2** | Measure $\hat\rho_j$ on the cohort: fit probe vessel voxels (not in the AIF mask) with each subject's AutoAIF AIF. Report the implied offset $\hat\rho_j \cdot \bar v_p$ against the between-subject SD of $K^{\text{trans}}$. Cross-check with the tissue $K$–$v_p$ slope (§5.5b) | AutoAIF outputs, probe-vessel masks, Patlak maps | Implied offset under about 10% of between-subject $K^{\text{trans}}$ SD: leverage error is not a problem |
+| **3** | Scale: triple collocation (§6.2) gives the error variance of AutoAIF amplitude per site | dose, weight, sinus voxels, optionally Hct | AutoAIF amplitude error variance is small next to biological spread |
+| **4** | Tissue residual as a detector: corrupt real AIFs deliberately (saturation, tail ramp, delay, scale) and check that paired $\Delta R$ ranks them as §5.3–5.4 predicts | Gate 0 pipeline | It does not detect peak distortions on real data: drop it from candidate ranking |
+| **5** | Correction: EB-shrunk $\rho^{\ast}_j$, scale calibration, candidate selection. Evaluate on $K^{\text{trans}}$ test–retest and against two baselines: uncorrected AutoAIF, and the site population AIF. Check that a known group difference is preserved | repeat sessions | It does not beat **both** baselines |
+
+Gates 1–3 are measurement, not method development, and each can end the project cheaply.
+
+**Backlog (for a general-purpose tool, not needed for subtle-leakage $K^{\text{trans}}$):**
+the voxel-level mixture EM (v1 §7–§8, with the review's §4.5 fixes), arterial vs venous
+discrimination, first-pass recovery for flow, the forward model for undersampled sites (review
+§5.4), and FPCA shape shrinkage.
+
+---
+
+## 9. Open questions
+
+1. Are the manual masks arterial, sinus, or mixed by site? (decides probe-vessel independence, §5.5)
+2. Which AIF goes downstream today: soft-weighted curve or top-20 native mask?
+3. Which kinetic fitting code and model are used on this cohort: ROCKETSHIP Patlak? Fitted delay?
+4. Per site: frame duration, scan length, dose, flip angle and TR (Gate 1), and whether $T_{10}$
+   maps exist.
+5. Is the sagittal sinus in the field of view at every site? Is an artery?
+6. How many subjects have repeat sessions, per site? (Gate 5)
+7. Are hematocrit, weight and eGFR recorded? (scale anchor $X_3$)
+8. Is white-matter $v_p$ ever an outcome? (decides whether it can be an anchor, §6.2)
+
+---
+
+## Appendix A. How ComBat / neuroCombat works
+
+References: Johnson, Li & Rabinovic (2007) for the method; Fortin et al. (2017, 2018) for
+neuroCombat. The formulas follow the neuroCombat code (`aprior`, `bprior`, `postmean`, `postvar`,
+`it_sol`).
+
+### A.1 Model
+
+Batch (site) $i$, sample $j$ within batch, feature $v$:
 
 $$
 y_{ijv} = \alpha_v + \mathbf{x}_{ij}^\top \boldsymbol\beta_v + \gamma_{iv} + \delta_{iv}\,\varepsilon_{ijv},
 \qquad \varepsilon_{ijv} \sim \mathcal N(0, \sigma_v^2)
 $$
 
-- $\alpha_v$: feature grand mean.
-- $\mathbf x_{ij}^\top \boldsymbol\beta_v$: biological covariates (age, sex,
-  diagnosis) whose effects must be **preserved**.
-- $\gamma_{iv}$: additive batch effect (shift in location).
-- $\delta_{iv}$: multiplicative batch effect (change in scale).
+$\alpha_v$ is the feature mean, $\mathbf x^\top\boldsymbol\beta_v$ holds the biological covariates
+to **preserve**, and $\gamma_{iv}$ and $\delta_{iv}$ are the additive and multiplicative batch
+effects to **remove**.
 
-The goal is to estimate $\gamma_{iv}$ and $\delta_{iv}$ and remove them.
+### A.2 Standardize
 
-### 3.2 Step 1: standardize
-
-Fit $\alpha_v, \boldsymbol\beta_v$ and batch indicators by least squares,
-feature by feature. Estimate a pooled residual variance $\hat\sigma_v^2$. Then
+Fit $\alpha_v$, $\boldsymbol\beta_v$ and batch indicators by least squares and pool the residual
+variance $\hat\sigma_v^2$:
 
 $$
 z_{ijv} = \frac{y_{ijv} - \hat\alpha_v - \mathbf x_{ij}^\top \hat{\boldsymbol\beta}_v}{\hat\sigma_v}
 $$
 
-After this, every feature is on a common scale, so batch effects of different
-features can be compared with each other. **That comparability is what makes
-the next step possible.**
+This puts all features on one scale, so their batch effects can be compared.
 
-### 3.3 Step 2: naive per-batch, per-feature estimates
-
-For batch $i$ with $n_i$ samples:
+### A.3 Naive estimates
 
 $$
 \hat\gamma_{iv} = \frac{1}{n_i}\sum_j z_{ijv},
@@ -108,12 +453,7 @@ $$
 \hat\delta^2_{iv} = \frac{1}{n_i - 1}\sum_j \left(z_{ijv} - \hat\gamma_{iv}\right)^2
 $$
 
-With small $n_i$ these are noisy, and there are thousands of them.
-
-### 3.4 Step 3: the empirical Bayes prior, shared across features
-
-The key modeling choice: **within one batch, the batch effects of different
-features are exchangeable draws from a common distribution.**
+### A.4 Empirical Bayes prior, shared across features within a batch
 
 $$
 \gamma_{iv} \sim \mathcal N(\gamma_i,\ \tau_i^2),
@@ -121,26 +461,11 @@ $$
 \delta^2_{iv} \sim \text{InvGamma}(\lambda_i,\ \theta_i)
 $$
 
-The hyperparameters $(\gamma_i, \tau_i^2, \lambda_i, \theta_i)$ are **per batch, shared over all features**.
-They are estimated from the data by the method of moments across features (that
-is what makes it *empirical* Bayes):
-
-$$
-\bar\gamma_i = \frac{1}{V}\sum_v \hat\gamma_{iv},
-\qquad
-\bar\tau_i^2 = \frac{1}{V-1}\sum_v \left(\hat\gamma_{iv} - \bar\gamma_i\right)^2
-$$
-
-For the inverse gamma, let $M$ and $S^2$ be the mean and variance of
-$\{\hat\delta^2_{iv}\}_v$. If $X \sim \text{InvGamma}(\lambda, \theta)$ then
-
-$$
-\mathbb E[X] = \frac{\theta}{\lambda - 1},
-\qquad
-\operatorname{Var}[X] = \frac{\theta^2}{(\lambda-1)^2(\lambda-2)}
-$$
-
-so $\operatorname{Var}/\mathbb E^2 = 1/(\lambda - 2)$. Solving the two moment equations:
+The hyperparameters are estimated by method of moments across features:
+$\bar\gamma_i = \operatorname{mean}_v \hat\gamma_{iv}$ and
+$\bar\tau_i^2 = \operatorname{var}_v \hat\gamma_{iv}$. With $M$ and $S^2$ the mean and variance of
+$\{\hat\delta^2_{iv}\}_v$, the inverse-gamma moments $\mathbb E = \theta/(\lambda-1)$ and
+$\operatorname{Var} = \theta^2/((\lambda-1)^2(\lambda-2))$ give
 
 $$
 \bar\lambda_i = \frac{M^2 + 2S^2}{S^2},
@@ -148,535 +473,108 @@ $$
 \bar\theta_i = \frac{M^3 + M S^2}{S^2}
 $$
 
-These are exactly `aprior` and `bprior` in neuroCombat.
+### A.5 Posterior estimates
 
-### 3.5 Step 4: posterior estimates (the shrinkage)
-
-**Location.** Condition on $\delta^2_{iv}$. The samples give
-$\bar z_{iv} = \hat\gamma_{iv}$ with likelihood $\mathcal N(\gamma_{iv}, \delta^2_{iv}/n_i)$.
-Combined with the normal prior, a normal-normal conjugate update gives
+Normal–normal conjugacy, conditional on $\delta^2$:
 
 $$
-\gamma^{\ast}_{iv}
-= \frac{\dfrac{\bar\gamma_i}{\bar\tau_i^2} + \dfrac{n_i\,\hat\gamma_{iv}}{\delta^2_{iv}}}{\dfrac{1}{\bar\tau_i^2} + \dfrac{n_i}{\delta^2_{iv}}}
-= \frac{n_i \bar\tau_i^2\, \hat\gamma_{iv} + \delta^{2}_{iv}\, \bar\gamma_i}{n_i \bar\tau_i^2 + \delta^{2}_{iv}}
-$$
-
-This is a precision-weighted average: data precision $n_i/\delta^2$ against prior
-precision $1/\tau^2$. Written as a shrinkage weight:
-
-$$
-\gamma^{\ast}_{iv} = w_{iv}\,\hat\gamma_{iv} + (1 - w_{iv})\,\bar\gamma_i,
+\gamma^{\ast}_{iv} = \frac{n_i \bar\tau_i^2\, \hat\gamma_{iv} + \delta^{2}_{iv}\, \bar\gamma_i}{n_i \bar\tau_i^2 + \delta^{2}_{iv}}
+= w_{iv}\,\hat\gamma_{iv} + (1 - w_{iv})\,\bar\gamma_i,
 \qquad
 w_{iv} = \frac{\bar\tau_i^2}{\bar\tau_i^2 + \delta^2_{iv}/n_i}
 $$
 
-$w \to 1$ (trust the data) when the batch has many samples or the features truly
-differ a lot ($\tau^2$ large). $w \to 0$ (trust the prior) when the data are noisy.
-
-**Scale.** Condition on $\gamma_{iv}$. The inverse-gamma prior is conjugate for a
-normal variance, so the conditional posterior is
-$\text{InvGamma}\left(\lambda_i + n_i/2,\ \theta_i + \tfrac12 \sum_j (z_{ijv} - \gamma_{iv})^2\right)$,
-whose mean is
+The inverse gamma is conjugate for a normal variance, conditional on $\gamma$:
 
 $$
 \delta^{2\ast}_{iv} = \frac{\bar\theta_i + \tfrac12 \sum_j \left(z_{ijv} - \gamma^{\ast}_{iv}\right)^2}{n_i/2 + \bar\lambda_i - 1}
 $$
 
-These are `postmean` and `postvar`.
+`it_sol` alternates these two conditional posterior means until the relative change is below
+$10^{-4}$. This is a deterministic fixed-point scheme, not a full posterior. A nonparametric variant
+replaces the priors with the empirical distribution of the other features' estimates.
 
-**Iteration.** The two updates depend on each other ($\gamma^\ast$ needs $\delta^2$,
-$\delta^{2\ast}$ needs $\gamma$). The priors are independent (not the joint
-normal-inverse-gamma), so there is no closed form for the joint posterior.
-neuroCombat (`it_sol`) starts from the naive estimates and alternates the two
-conditional posterior means until the relative change is below $10^{-4}$. This is a
-deterministic fixed-point scheme (like iterated conditional modes). It is not a
-full posterior. It works well because it usually converges in a few iterations.
-
-There is also a nonparametric variant (`parametric=False`) that replaces the
-normal/inverse-gamma priors with the empirical distribution of the other
-features' $(\hat\gamma, \hat\delta^2)$ and computes the posterior mean by weighting
-each by its likelihood.
-
-### 3.6 Step 5: adjust the data
+### A.6 Adjust
 
 $$
 y^{\ast}_{ijv} = \frac{\hat\sigma_v}{\delta^{\ast}_{iv}}\left(z_{ijv} - \gamma^{\ast}_{iv}\right) + \hat\alpha_v + \mathbf x_{ij}^\top \hat{\boldsymbol\beta}_v
 $$
 
-### 3.7 Why it works: James–Stein and empirical Bayes
+### A.7 Justification and limits
 
-If you estimate $p \ge 3$ normal means at once with squared-error loss, the
-separate sample means are **inadmissible**. James–Stein shrinkage toward a common
-point has lower total risk for every value of the true means (James & Stein 1961).
-Efron & Morris (1973, 1975) showed that the James–Stein estimator is what you get
-from an empirical Bayes argument: assume the means come from a common normal,
-estimate that normal from the data, and take posterior means. ComBat applies this
-to thousands of batch-effect parameters.
-
-Two points carry over to our problem and matter a lot:
-
-1. **The guarantee is about total error across units, not each unit.** A unit
-   that truly is an outlier gets biased toward the mean. On average you win.
-2. **In ComBat the shrunk quantity is a nuisance** (the scanner effect), which you
-   then remove. **For us, the shrunk quantity is the signal we want** (each
-   subject's real AIF). That changes how much bias is acceptable (§9.1).
+This is James–Stein / empirical Bayes shrinkage (James & Stein 1961; Efron & Morris 1973, 1975):
+for three or more normal means, pooling lowers *total* squared error. The guarantee assumes equal,
+known variances and holds on average, not for each unit. A true outlier is biased toward the mean;
+limited-translation rules (Efron & Morris 1972) cap that. In ComBat the shrunk quantity is a
+nuisance that gets removed. §6 uses the same structure for the same reason.
 
 ---
 
-## 4. Mapping ComBat onto the AIF problem
+## Appendix B. Why naive iteration of shrinkage collapses
 
-The analogy works, but it is **transposed**:
+Scalar case: each unit's estimate has sampling variance $e$, and the observed spread is $s^2$.
+With $w = \tau^2/(\tau^2 + e)$:
 
-| ComBat | Population AIF |
-|---|---|
-| batch $i$ | subject $j$ |
-| samples $j$ within a batch | voxels $v$ within the subject's arterial ROI |
-| feature $v$ | AIF component $k$ (a curve parameter or FPCA score) |
-| $\hat\gamma_{iv}$ = batch mean of feature | $\hat\xi_{jk}$ = subject's component $k$, averaged over voxels |
-| $\hat\delta^2_{iv}$ = within-batch variance | $\hat\delta^2_{jk}$ = scatter of component $k$ across the subject's voxels |
-| prior shared **across features**, per batch | prior shared **across subjects**, per component |
-| $n_i$ = samples in batch | $n_j$ = (effective) number of arterial voxels |
-| covariates $\mathbf x$ preserved | covariates (dose/kg, age, hematocrit, cardiac output, site) set the prior mean |
+**Naive** (re-estimate $\tau^2$ from shrunk values):
+$\tau^2_{\text{new}} = w^2 s^2$. The fixed points are $\tau^2 = 0$, which is always **stable**
+(near zero, $\tau^2_{\text{new}} \approx \tau^4 s^2/e^2$), and the roots of
+$(\tau^2 + e)^2 = \tau^2 s^2$. Those roots exist only if $s^2 \ge 4e$, and the upper one is biased low.
 
-So the textbook model for us is the **hierarchical normal model** (the "eight
-schools" model, Gelman et al. BDA3 ch. 5), equivalently a linear mixed model with
-subject random effects. ComBat is one well-known application of the same math.
-The only real structural difference is which index the prior pools over.
+**EM** (add the posterior variance):
+$\tau^2_{\text{new}} = w^2 s^2 + w e$, whose only positive fixed point is $\tau^2 = s^2 - e$,
+the moment estimate.
 
----
-
-## 5. Representing an AIF so that shrinkage makes sense
-
-Shrinkage needs a representation $\boldsymbol\xi_j \in \mathbb R^K$ of each AIF in
-which (a) a Gaussian prior is reasonable, (b) components are roughly independent
-across subjects (so a diagonal prior is defensible, like ComBat's per-feature
-treatment), and (c) every subject is on a common time axis and scale.
-
-**Prerequisites, whichever representation we pick:**
-
-- **Scale:** relative enhancement $(S(t) - S_0)/S_0$ at minimum. Concentration
-  (needs $T_{10}$, flip angle, $r_1$) is better because then amplitude is
-  physiological rather than sequence-dependent.
-- **Time:** physical seconds, aligned to bolus arrival time (BAT). BAT itself
-  (injection timing) is a nuisance. Keep it per subject; don't shrink it.
-
-**Options:**
-
-1. **Raw time samples** ($K = T$). Simple, but the components are strongly
-   correlated, so a diagonal prior is wrong and a full $T\times T$ covariance
-   needs many subjects. Not recommended alone.
-2. **Parametric model** (e.g. the Parker 2006 population AIF form: two Gaussians plus
-   a sigmoid-modulated exponential; or a gamma-variate plus washout). The parameters
-   can be interpreted (peak amplitude, width, recirculation, washout rate) and can
-   be log-transformed to look normal. The drawback: nonlinear fits, correlated
-   parameters, and model misfit ends up in the residuals.
-3. **Functional PCA (FPCA)** on aligned curves:
-   $$
-   c_j(t) \approx \mu(t) + \sum_{k=1}^{K} \xi_{jk}\, \phi_k(t)
-   $$
-   Scores are uncorrelated across subjects **by construction**, so a diagonal
-   prior is justified. The model is linear, so everything below is closed form.
-   This is also exactly the setting of PACE (Yao, Müller & Wang 2005), whose score
-   estimates *are* shrinkage (BLUP) estimates.
-
-**Recommendation:** FPCA for the method itself, because it is the cleanest match
-to ComBat's math. Fit a parametric model on top only for reporting and checking
-that results are physiologically plausible.
-
----
-
-## 6. Stage 1: post-hoc empirical Bayes shrinkage of subject AIFs
-
-This stage takes the voxels the network already chose (fixed weights $r_{jv}$, for
-example $m_{jv}$ or the top-$N$ indicator) and only shrinks the resulting AIFs.
-
-### 6.1 Voxel-level summary per subject
-
-Project each selected voxel's curve onto the FPCA basis (orthonormal
-$\phi_k$):
-
-$$
-\hat\xi_{jvk} = \left\langle y_{jv} - \mu,\ \phi_k \right\rangle
-$$
-
-Then, exactly as in ComBat step 2, with weights $r_{jv}$ and
-$n_j = \sum_v r_{jv}$:
-
-$$
-\hat\xi_{jk} = \frac{1}{n_j}\sum_v r_{jv}\,\hat\xi_{jvk},
-\qquad
-\hat\delta^2_{jk} = \frac{1}{n_j - 1}\sum_v r_{jv}\left(\hat\xi_{jvk} - \hat\xi_{jk}\right)^2
-$$
-
-### 6.2 Hierarchical model
-
-$$
-\hat\xi_{jk} \mid \xi_{jk} \sim \mathcal N\!\left(\xi_{jk},\ \frac{\delta^2_{jk}}{n_j^{\text{eff}}}\right)
-$$
-
-$$
-\xi_{jk} \sim \mathcal N\!\left(\mu_{s(j),k} + \mathbf x_j^\top \boldsymbol\beta_k,\ \tau_k^2\right),
-\qquad
-\delta^2_{jk} \sim \text{InvGamma}(\lambda_k,\ \theta_k)
-$$
-
-- The prior mean is per site $s(j)$ (and per covariate). Sites differ in dose
-  protocol, injection rate and temporal resolution, so shrinking a site-A AIF
-  toward a pooled mean that includes site B would introduce bias. This plays the
-  role of ComBat's protected $\mathbf x^\top\boldsymbol\beta$.
-- $n_j^{\text{eff}} \le n_j$ is the **effective** number of independent voxels
-  (see §9.4). This matters: it sets how much we trust each subject.
-
-### 6.3 Posterior (shrunk) scores
-
-Same algebra as §3.5:
-
-$$
-\xi^{\ast}_{jk} = w_{jk}\,\hat\xi_{jk} + (1 - w_{jk})\left(\hat\mu_{s(j),k} + \mathbf x_j^\top\hat{\boldsymbol\beta}_k\right),
-\qquad
-w_{jk} = \frac{\hat\tau_k^2}{\hat\tau_k^2 + \delta^{2\ast}_{jk}/n_j^{\text{eff}}}
-$$
-
-$$
-\delta^{2\ast}_{jk} = \frac{\hat\theta_k + \tfrac12\sum_v r_{jv}\left(\hat\xi_{jvk} - \xi^{\ast}_{jk}\right)^2}{n_j/2 + \hat\lambda_k - 1}
-$$
-
-The shrunk AIF is $c^{\ast}_j(t) = \hat\mu(t) + \sum_k \xi^{\ast}_{jk}\phi_k(t)$, and the posterior
-variance of each score is
-
-$$
-V_{jk} = \left(\frac{1}{\hat\tau_k^2} + \frac{n_j^{\text{eff}}}{\delta^{2\ast}_{jk}}\right)^{-1}
-$$
-
-which gives every AIF a pointwise credible band for free. That is useful in itself
-for propagating AIF uncertainty into $K^{\text{trans}}$.
-
-**How the behavior reads:**
-
-- **Subject with many clean arterial voxels:** $n^{\text{eff}}$ large, $w \approx 1$,
-  so the AIF is essentially unchanged.
-- **Subject with 3 partial-volumed voxels:** $w$ small, so the AIF is pulled toward
-  the site mean, but only in the components where the voxels disagree with each
-  other.
-- **Component where subjects genuinely differ a lot** (large $\tau_k^2$, for
-  example peak width): little shrinkage. **Component where subjects are all alike**
-  (small $\tau_k^2$): strong shrinkage. The data decide this; we don't tune it by
-  hand.
-- **Variance shrinkage** (the $\delta^2$ part) stabilizes $w$ itself when a subject
-  has so few voxels that its own scatter estimate is meaningless (top-5 voxels).
-
-### 6.4 Two extremes as special cases
-
-- $w_{jk} = 1$ for all $j,k$ gives individual AIFs (current AutoAIF).
-- $w_{jk} = 0$ for all $j,k$ gives a site-specific population AIF.
-
-The DCE literature has argued individual vs population AIF for years. Empirical
-Bayes is the principled interpolation between the two, and the data choose where
-to sit.
-
----
-
-## 7. Stage 2: population-informed voxel selection (the mixture model)
-
-This formalizes "among voxels the network rates highly, choose those that agree
-better with the population".
-
-### 7.1 Model
-
-Each candidate voxel either is arterial ($z_{jv} = 1$) or is not (venous, tissue,
-partial volume with tissue, noise):
-
-$$
-z_{jv} \sim \text{Bernoulli}(\pi_{jv}),
-\qquad
-\pi_{jv} = h(m_{jv})
-$$
-
-$$
-y_{jv} \mid z_{jv} = 1 \sim \mathcal N\!\left(a_{jv}\, c_j,\ \sigma_j^2 I\right),
-\qquad
-y_{jv} \mid z_{jv} = 0 \sim g_j
-$$
-
-- **The network score is the prior probability of being arterial.** $h$ is a
-  calibration map, estimated once on data with manual masks (for example Platt
-  scaling), because a sigmoid output is not a calibrated probability.
-- $a_{jv} \in (0, 1]$ is an optional per-voxel partial-volume scale. With $a$ in
-  the model, voxel agreement is judged on **shape**, and amplitude is handled
-  separately (§9.2).
-- $g_j$ is a broad background density (a wide Gaussian around the subject's mean
-  tissue curve, or a second FPCA-based component for "venous-like").
-- $c_j$ has the prior from §6: $c_j = \mu + \Phi\boldsymbol\xi_j$ with
-  $\boldsymbol\xi_j \sim \mathcal N(\mu_s, \operatorname{diag}(\tau^2))$.
-
-### 7.2 EM within one subject (hyperparameters held fixed)
-
-**E-step (voxel responsibilities):**
-
-$$
-r_{jv} = \frac{\pi_{jv}\,\mathcal N\!\left(y_{jv};\ a_{jv} c_j,\ \sigma_j^2 I\right)}{\pi_{jv}\,\mathcal N\!\left(y_{jv};\ a_{jv} c_j,\ \sigma_j^2 I\right) + (1 - \pi_{jv})\, g_j(y_{jv})}
-$$
-
-**M-step (subject AIF):** maximize
-$\sum_v r_{jv}\log\mathcal N(y_{jv}; c_j, \sigma_j^2 I) + \log p(\boldsymbol\xi_j)$
-(with $a = 1$ for clarity). The result is **exactly the shrinkage formula of §6.3**
-with $n_j = \sum_v r_{jv}$:
-
-$$
-\xi^{\ast}_{jk} = \frac{\tau_k^2\, n_j\, \bar\xi_{jk} + \sigma_j^2\, \mu_{s,k}}{\tau_k^2\, n_j + \sigma_j^2},
-\qquad
-\bar\xi_{jk} = \frac{\sum_v r_{jv}\, \hat\xi_{jvk}}{\sum_v r_{jv}}
-$$
-
-This ties the two ideas together: **voxel selection and Bayesian shrinkage are the
-E- and M-steps of one algorithm.** The current AutoAIF estimator is the special
-case $r_{jv} = m_{jv}$ (no E-step) and $\tau^2 \to \infty$ (no prior).
-
-### 7.3 The subtle point: agree with *what*?
-
-In the E-step a voxel is judged against the **subject's own current AIF**
-$c_j$, which is already shrunk. It is *not* judged against the population mean
-directly. The population enters only through the prior on $c_j$. This matters:
-
-- A subject whose real AIF is unusual but well supported (many consistent voxels)
-  keeps its unusual AIF, because the voxels agree with each other and $w \approx 1$.
-- A subject with conflicting candidate voxels (some arterial, some venous) gets
-  pulled toward the population, and the prior **breaks the tie** in favor of the
-  arterial-looking cluster. This is where we expect the method to help most.
-
-Selecting voxels by distance to the population mean would discard real
-between-subject variation. That is the naive reading of the idea, and we should
-avoid it.
-
-### 7.4 Hard selection is classification EM
-
-"Pick the top-$N$ by $m$, then keep those closest to the curve" is the hard version:
-$r_{jv} \in \{0,1\}$ by thresholding the posterior. This is *classification EM*
-(Celeux & Govaert 1992). It is simpler and often fine for point estimates, but it is
-known to **underestimate variances**: truncating to the conforming voxels makes the
-within-subject scatter $\hat\delta^2$ too small, which inflates $n/\delta^2$ and makes
-the subject look more certain than it is. Soft $r_{jv}$ avoids that. If we
-want hard masks for downstream tools, compute them at the end from the converged
-$r_{jv}$.
-
----
-
-## 8. Stage 3: iterate, which is EM for the population hyperparameters
-
-The outer loop ("update the population average, then update the shrinkage") is
-the M-step for the hyperparameters $\Theta = \{\mu_s, \boldsymbol\beta, \tau^2, \lambda, \theta, \mu(t), \Phi\}$.
-
-### 8.1 The correct update
-
-For the variance components the EM update is
-
-$$
-\hat\tau_k^{2,\text{new}} = \frac{1}{J}\sum_j\left[\left(\xi^{\ast}_{jk} - \hat\mu_{s(j),k} - \mathbf x_j^\top\hat{\boldsymbol\beta}_k\right)^2 + V_{jk}\right]
-$$
-
-The $V_{jk}$ term (the posterior variance of each subject's score) is the
-important part. It accounts for the fact that $\xi^{\ast}_{jk}$ are *shrunk*
-estimates, which are less spread out than the true $\xi_{jk}$. Iterating this
-increases the marginal likelihood $p(\text{all voxels} \mid \Theta)$ at every
-step (Dempster, Laird & Rubin 1977), so the loop has a well-defined objective and
-converges.
-
-### 8.2 The naive update collapses
-
-If you instead re-estimate the population variance from the shrunk AIFs as if they
-were data (dropping $V_{jk}$), the loop drifts toward "every subject equals the
-population mean". This is easy to show in the scalar case. Let every subject
-have sampling variance $e = \delta^2/n$ and let $s^2$ be the observed spread of
-$\hat\xi_j$. With $w = \tau^2/(\tau^2 + e)$:
-
-**Naive:**
-$$
-\tau^2_{\text{new}} = w^2 s^2
-\quad\Longrightarrow\quad
-\text{fixed points: } \tau^2 = 0 \ \text{ and } \ (\tau^2 + e)^2 = \tau^2 s^2
-$$
-
-$\tau^2 = 0$ is always a **stable** fixed point: near zero,
-$\tau^2_{\text{new}} \approx \tau^4 s^2/e^2 \ll \tau^2$. Nonzero fixed points exist only
-if $s^2 \ge 4e$, and even then the upper one is biased low.
-
-**EM:**
-$$
-\tau^2_{\text{new}} = w^2 s^2 + w e
-\quad\Longrightarrow\quad
-(\tau^2 + e)^2 = \tau^2 s^2 + e(\tau^2 + e)
-\quad\Longrightarrow\quad
-\tau^2 = s^2 - e
-$$
-
-which is the correct moment estimate: the observed spread minus the noise.
-
-A quick numerical check ($J = 60$, 500 iterations) agrees:
-
-| Case | Truth / MoM $\tau^2$ | Naive loop | EM loop |
+| Case ($J = 60$) | Truth / MoM | Naive | EM |
 |---|---|---|---|
-| $e = 0.5$, $s^2 = 1.17$ ($s^2 < 4e$) | 0.67 | **0.00** from any start | 0.67 |
-| $e = 0.1$, $s^2 = 0.78$ ($s^2 \ge 4e$) | 0.68 | 0.56 from a high start; **0.00** from a low start | 0.68 |
+| $e = 0.5$, $s^2 = 1.17$ | 0.67 | 0.00 from any start | 0.67 |
+| $e = 0.1$, $s^2 = 0.78$ | 0.68 | 0.56 from a high start, 0.00 from a low start | 0.68 |
 
-Voxel re-selection makes this worse: picking voxels that agree with the shrunk
-curve reduces $s^2$ and $\hat\delta^2$ further every round. **The safeguards are not
-optional:** soft responsibilities (§7.4), the $V_{jk}$ term, and judging voxels
-against the subject's curve rather than the population mean (§7.3).
-
-### 8.3 The full algorithm
-
-```
-initialize: r_jv = m_jv (current AutoAIF), fit mu(t), Phi by FPCA on current AIFs,
-            hyperparameters by method of moments (as ComBat)
-repeat until marginal log-likelihood changes < tol:
-    for each subject j:                       # inner loop, hyperparameters fixed
-        repeat:
-            E-step:  r_jv  from  pi_jv, current c_j, sigma_j^2, g_j        (§7.2)
-            M-step:  xi*_jk, delta2*_jk, V_jk  (ComBat-style it_sol)       (§6.3)
-    hyper M-step: mu_s, beta, tau_k^2 (with V_jk), lambda_k, theta_k       (§8.1)
-    (optionally) re-fit mu(t), Phi on posterior curves, with care
-output: c*_j(t), pointwise bands from V_jk, final r_jv (soft voxel weights)
-```
-
-Re-fitting the FPCA basis inside the loop is the least principled step. Freezing
-the basis after the first pass is the safe default.
+With fixed inputs, EM converges to the one-pass moment estimate, so iterating buys nothing unless
+the inputs (voxel or candidate selection) change. If they do, use soft weights and keep the
+posterior-variance term.
 
 ---
 
-## 9. Where the assumptions break
+## References
 
-### 9.1 Real between-subject variation
+Citations are from memory. Check volume and page details before reusing them in a manuscript.
 
-AIFs genuinely differ: cardiac output, hematocrit, injection rate, body size,
-vascular disease. Empirical Bayes keeps that variation only to the extent that
-each subject's data are precise enough to show it. For downstream pharmacokinetics,
-$K^{\text{trans}}$ and $v_p$ scale roughly as $1/\text{AIF amplitude}$, so any bias in amplitude
-goes straight into the parameters.
-
-- Put known drivers in the prior mean ($\mathbf x_j$): dose/kg, age, sex,
-  hematocrit if available, site.
-- **Group studies:** if disease status changes AIF shape (for example through cardiac
-  output) and we shrink everyone toward a pooled mean, we partly erase a real
-  group difference in AIF and **move it into $K^{\text{trans}}$**. Including group in
-  $\mathbf x_j$ avoids this but makes the prior depend on the label being studied.
-  This needs a decision (§11).
-
-### 9.2 Shared bias is not fixed by shrinkage
-
-Shrinkage reduces **variance** across subjects. It cannot remove a bias that every
-subject shares. Partial volume underestimates peak amplitude in almost everyone,
-so the population mean underestimates it too, and shrinking toward it doesn't
-help. Amplitude needs an external anchor: a venous output function scaled to the
-arterial curve, a physiological constraint (for example the first-pass area
-implied by dose and cardiac output), or modeling $a_{jv}$ explicitly and taking the
-amplitude from the voxels with the largest $a$.
-
-### 9.3 Non-Gaussian populations and outliers
-
-A subject with a failed injection or extravasation should not pull the population
-mean, and should not be shrunk into looking normal. Options: a Student-$t$ prior
-on $\xi_{jk}$ (heavier tails shrink outliers less), or the ComBat nonparametric
-prior (§3.5). Also flag subjects with very low marginal likelihood for manual
-review instead of silently shrinking them.
-
-### 9.4 Correlated voxels: effective $n$
-
-Neighboring voxels are correlated (point spread function, and AutoAIF's own
-resample to $256\times256\times32$ and back), and their errors share systematic parts
-(the same partial-volume pattern, the same inflow). Using the raw voxel count
-makes subjects look too precise ($w$ too close to 1, too little shrinkage).
-Estimate $n^{\text{eff}}$ by a spatial block bootstrap of $\hat\xi_{jk}$ over voxels, or
-treat connected clusters (vessel segments) rather than voxels as the units.
-
-### 9.5 Few subjects per site
-
-The hyperparameters are themselves estimated. With small $J$ per site,
-$\hat\tau_k^2$ is uncertain, and plug-in empirical Bayes understates uncertainty.
-Options: share $\tau_k^2$ across sites and let only $\mu_s$ vary by site
-(partial pooling of sites, a 3-level model); or full Bayes (PyMC/Stan) with
-weak hyperpriors. Leave-one-out hyperparameters (each subject's prior estimated
-without it) prevent a subject from pulling its own prior, which matters when $J$ is small.
-
-### 9.6 Time axis
-
-The network sees 32 resampled frames regardless of acquisition length or temporal
-resolution. Curves from different sites are only comparable after mapping to
-seconds and aligning on bolus arrival. The population model needs scan timing
-metadata per site. Very coarse temporal resolution also smooths the peak, which is
-a site-level effect for $\mu_s$ to absorb, not something to shrink away.
-
----
-
-## 10. How we would know it works
-
-No in-vivo ground truth exists, so we need several complementary checks:
-
-1. **Simulation with known truth.** Synthetic DCE volumes with known AIFs drawn
-   from a realistic population, with partial volume, noise and venous
-   contamination added, at varying numbers of arterial voxels. Measure AIF error
-   and $K^{\text{trans}}$ error for: individual (current), population, Stage 1, Stage 1+2.
-   Expect the biggest gains for low-$n$ subjects and no loss for high-$n$ subjects.
-2. **Test–retest / longitudinal reproducibility.** The data include repeat
-   timepoints (e.g. `*_1st_timepoint`). Within-subject coefficient of variation of
-   AIF peak, AUC and tissue $K^{\text{trans}}$ across sessions should drop.
-3. **Agreement with manual AIFs** from the training masks (held-out subjects
-   only).
-4. **Held-out voxel prediction.** Split each subject's arterial voxels in two
-   halves. Estimate the AIF from half A (with and without shrinkage) and score the
-   predictive likelihood of half B. This is a direct, label-free test that
-   shrinkage improves the estimate.
-5. **Physiological plausibility.** $v_p$ in normal white matter and gray matter, and
-   $K^{\text{trans}}$ in tissue with an intact barrier should have tighter
-   distributions without shifting their means.
-6. **Variance decomposition first (Stage 0).** Before building anything, measure
-   how much of the observed AIF variance across subjects is within-subject voxel
-   scatter versus real between-subject spread. If the typical $w_{jk}$ is above 0.95,
-   shrinkage won't change anything and Stage 2 is where any gain would come from.
-   This is cheap and tells us whether to proceed.
-
----
-
-## 11. Open questions / decisions
-
-- [ ] Representation: FPCA scores (recommended), Parker-model parameters, or both?
-- [ ] Signal scale: relative enhancement now, concentration later? Do we have $T_{10}$
-      maps for all sites?
-- [ ] Prior structure: per-site means with a shared $\tau^2$, or a full 3-level model?
-- [ ] Covariates in the prior mean: which are available cohort-wide (dose, weight,
-      hematocrit, age)?
-- [ ] Group studies: include diagnosis in $\mathbf x_j$ or not (§9.1)?
-- [ ] Soft responsibilities or hard top-$N$ masks as the final output?
-- [ ] How to calibrate $h(m)$: Platt scaling against manual masks?
-- [ ] Amplitude anchor (§9.2): VOF scaling, $a_{jv}$ model, or accept the bias?
-- [ ] Which dataset for Stage 0 (variance decomposition)?
-
----
-
-## 12. References
-
-- Johnson WE, Li C, Rabinovic A. Adjusting batch effects in microarray expression
-  data using empirical Bayes methods. *Biostatistics* 2007;8(1):118–127.
-- Fortin J-P et al. Harmonization of multi-site diffusion tensor imaging data.
-  *NeuroImage* 2017;161:149–170.
-- Fortin J-P et al. Harmonization of cortical thickness measurements across
-  scanners and sites. *NeuroImage* 2018;167:104–120.
+- Barnes SR et al. ROCKETSHIP: a flexible and modular software tool for the planning, processing
+  and analysis of dynamic MRI studies. *BMC Med Imaging* 2015;15:19.
+- Efron B, Morris C. Limiting the risk of Bayes and empirical Bayes estimators, part II: the
+  empirical Bayes case. *JASA* 1972;67:130–139.
+- Efron B, Morris C. Stein's estimation rule and its competitors: an empirical Bayes approach.
+  *JASA* 1973;68:117–130.
+- Efron B, Morris C. Data analysis using Stein's estimator and its generalizations. *JASA*
+  1975;70:311–319.
+- Fluckiger JU, Schabel MC, DiBella EVR. Model-based blind estimation of kinetic parameters in
+  dynamic contrast enhanced (DCE)-MRI. *MRM* 2009;62:1477–1486.
+- Fortin J-P et al. Harmonization of multi-site diffusion tensor imaging data. *NeuroImage*
+  2017;161:149–170.
+- Fortin J-P et al. Harmonization of cortical thickness measurements across scanners and sites.
+  *NeuroImage* 2018;167:104–120.
+- Heye AK et al. Tracer kinetic modelling for DCE-MRI quantification of subtle blood–brain barrier
+  permeability. *NeuroImage* 2016;125:446–455.
 - James W, Stein C. Estimation with quadratic loss. *Proc. 4th Berkeley Symp.* 1961.
-- Efron B, Morris C. Stein's estimation rule and its competitors: an empirical
-  Bayes approach. *JASA* 1973;68:117–130.
-- Efron B, Morris C. Data analysis using Stein's estimator and its
-  generalizations. *JASA* 1975;70:311–319.
-- Morris CN. Parametric empirical Bayes inference: theory and applications.
-  *JASA* 1983;78:47–55.
-- Dempster AP, Laird NM, Rubin DB. Maximum likelihood from incomplete data via
-  the EM algorithm. *JRSS B* 1977;39:1–38.
-- Celeux G, Govaert G. A classification EM algorithm for clustering and two
-  stochastic versions. *Comput. Stat. Data Anal.* 1992;14:315–332.
-- Yao F, Müller H-G, Wang J-L. Functional data analysis for sparse longitudinal
-  data. *JASA* 2005;100:577–590.
-- Gelman A et al. *Bayesian Data Analysis*, 3rd ed., ch. 5 (hierarchical models).
-- Parker GJM et al. Experimentally-derived functional form for a
-  population-averaged high-temporal-resolution arterial input function for
-  dynamic contrast-enhanced MRI. *MRM* 2006;56:993–1000.
-- Saca L et al. Automatic detection of arterial input function for brain DCE-MRI
-  in multi-site cohorts. *MRM* 2025;94(6):2732–2744.
+- Johnson WE, Li C, Rabinovic A. Adjusting batch effects in microarray expression data using
+  empirical Bayes methods. *Biostatistics* 2007;8:118–127.
+- Manning C et al. Sources of systematic error in DCE-MRI estimation of low-level blood–brain
+  barrier leakage. *MRM* 2021;86:1888–1903.
+- Parker GJM et al. Experimentally-derived functional form for a population-averaged
+  high-temporal-resolution arterial input function for dynamic contrast-enhanced MRI. *MRM*
+  2006;56:993–1000.
+- Patlak CS, Blasberg RG, Fenstermacher JD. Graphical evaluation of blood-to-brain transfer
+  constants from multiple-time uptake data. *JCBFM* 1983;3:1–7.
+- Riabkov DY, Di Bella EVR. Estimation of kinetic parameters without input functions: analysis of
+  three methods for multichannel blind identification. *IEEE TBME* 2002;49:1318–1327.
+- Saca L et al. Automatic detection of arterial input function for brain DCE-MRI in multi-site
+  cohorts. *MRM* 2025;94:2732–2744.
+- Schabel MC, Fluckiger JU, DiBella EVR. A model-constrained Monte Carlo method for blind arterial
+  input function estimation in dynamic contrast-enhanced MRI: I. Simulations. *Phys Med Biol*
+  2010;55:4783–4806.
+- Stoffelen A. Toward the true near-surface wind speed: error modeling and calibration using
+  triple collocation. *J Geophys Res* 1998;103:7755–7766.
+- Tofts PS et al. Estimating kinetic parameters from dynamic contrast-enhanced T1-weighted MRI of
+  a diffusable tracer: standardized quantities and symbols. *JMRI* 1999;10:223–232.
+- Weinmann HJ, Laniado M, Mützel W. Pharmacokinetics of GdDTPA/dimeglumine after intravenous
+  injection into healthy volunteers. *Physiol Chem Phys Med NMR* 1984;16:167–172.
