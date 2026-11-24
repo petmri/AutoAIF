@@ -90,7 +90,8 @@ def inference_mode(args, file):
         path = args.input_path[:-len(file)-5]
     nib.save(mask_img, args.save_output_path+ '/' + file + '_float_mask.nii')
     top20 = np.argsort(mask, axis=None)[-20:]
-    if top20.all() > 0.9:
+    # use the top 20 only if every one of them scores above 0.9; otherwise fall back to the top 5
+    if (mask.ravel()[top20] > 0.9).all():
         # save top 20 voxels as aif
         mask_top20 = np.zeros_like(mask)
         top20_indices = np.unravel_index(top20, mask.shape)
