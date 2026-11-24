@@ -1,10 +1,13 @@
 # AIF error and Ktrans: a population-informed plan
 
-**Status:** design draft v2, 2026-11-20. Supersedes v1 (commit `822e113`). It takes in the
-review in [population_aif_shrinkage_review.md](population_aif_shrinkage_review.md) and the PI's
-comments of 2026-11-20. Nothing here has been run on cohort data. The numbers in §3–§5 come from a
-noise-free simulation, [sims/aif_error_ktrans.py](sims/aif_error_ktrans.py), and depend on its
-assumptions (§3.2). Results and decisions from testing this go in eLabFTW (team VELA), not in this file.
+**Status:** design draft v2.1, 2026-11-24. v2 (2026-11-20) superseded v1 (commit `822e113`) and took
+in the review in [population_aif_shrinkage_review.md](population_aif_shrinkage_review.md) and the PI's
+comments of 2026-11-20. v2.1 adds the cohort's real protocols (§3.6), what the blind-estimation papers
+add (§5.7), and answers from the data inventory ([data_inventory.md](data_inventory.md)) to §2 and §9.
+No kinetic analysis has been run on cohort data yet; the inventory only reads metadata and fit logs. The
+numbers in §3–§5 come from a noise-free simulation, [sims/aif_error_ktrans.py](sims/aif_error_ktrans.py),
+and depend on its assumptions (§3.2). Results and decisions from testing this go in eLabFTW (team VELA),
+not in this file.
 
 **Rendering:** equations use GitHub/KaTeX math (`$...$` inline, `$$...$$` display). They render on
 GitHub and in the VS Code Markdown preview (`Ctrl+Shift+V`).
@@ -32,8 +35,9 @@ git history at `822e113`.
 - **Outcome:** $K^{\text{trans}}$ in brain, mostly subtle blood–brain barrier leakage
   ($K^{\text{trans}} \sim 0.5\text{–}3 \times 10^{-3}\ \text{min}^{-1}$, $v_p \sim 1\text{–}5\%$),
   with $v_p$ secondary. Lesions with larger leakage are a secondary case.
-- **Data:** about 15 s temporal resolution, scans of roughly 8 min (to be confirmed per site),
-  several sites.
+- **Data:** USC-PPG, 933 DCE sessions from 642 subjects at five sites, in five protocol groups:
+  frames of 7.9–15.6 s, 64 frames, scans of 8.4–16.6 min, Siemens and GE at 3 T
+  ([data_inventory.md](data_inventory.md) §2.1). About 60% of sessions are 16-min scans.
 - **Kinetic model:** Patlak for low-leakage brain, extended Tofts where leakage is larger.
 - **Loss:** per-subject error in $K^{\text{trans}}$, plus bias in group comparisons. AIF fidelity
   matters only as far as it moves these.
@@ -46,18 +50,28 @@ git history at `822e113`.
 
 These come from the review (§4.1) and need settling before any measurement means anything:
 
-1. **Name the baseline estimator.** The network's soft-weighted curve over the resampled volume, or
-   the top-20 hard mask applied to native data? Downstream fits presumably use the latter.
-2. **Bug:** [main_vif.py:93](../main_vif.py:93) tests `top20.all() > 0.9`, which checks the
-   *indices* returned by `argsort`, not mask values. It is true unless flat index 0 is in the top 20,
-   so the top-5 branch effectively never runs.
-3. **Time axis:** curves for kinetic fitting must come from the native frames. Preprocessing resamples
-   time to 32 frames with linear `zoom` ([utils_vif.py:42](../utils_vif.py:42)). That is fine for
-   finding voxels, not for the curve.
+1. **Baseline estimator (settled from the logs):** ROCKETSHIP averages the 20 top-voxel mask voxels
+   on native frames, converts to plasma concentration with Hct 0.45, and **fits a 4-parameter model to
+   that curve**. The fitted curve drives Patlak, which has no delay fit. The soft mask is not used. Any
+   error analysis must use this fitted AIF, or switch it off with ROCKETSHIP `--aif-mode raw`.
+2. **Bug (fixed in [petmri/AutoAIF#12](https://github.com/petmri/AutoAIF/pull/12), not merged):**
+   [main_vif.py:93](../main_vif.py:93) tested `top20.all() > 0.9`, which checks argsort indices, not
+   mask values. Every mask in the standard derivative is therefore top-20. Merging the fix changes the
+   AIF for weak-prediction sessions, so the baseline for this project must name which version it uses.
+3. **Time axis (settled):** kinetic fits already use native frames. The 32-frame resampling in
+   AutoAIF ([utils_vif.py:42](../utils_vif.py:42)) only affects voxel selection.
 4. **What $m_{jv}$ is:** the network is trained on the curve loss only and its output is min–max
    normalized per subject, so $m_{jv}$ is a voxel ranking, not a calibrated probability.
-5. **Arterial or venous masks?** Whether the manual training masks include the sagittal sinus
-   decides which vessel checks in §5.5 are independent of the AIF.
+5. **Arterial or venous masks? (answered, PI 2026-11-24)** The manual masks are mostly arterial; a few
+   are venous, usually the jugular. Venous probes are therefore independent of the AIF in most
+   sessions (§5.5).
+6. **Baseline window (settled):** the pre-contrast window ends around frame 2, usually 1–2 frames before
+   the AIF peak. In about 340 sessions the ROCKETSHIP A-stage log prints a degenerate detector value
+   ("image 1 to image 18"), but the logged concentrations show it is not the window used
+   (data_inventory §3).
+7. **Pre-contrast AIF $T_1$** has a median of 2.08 s in SIE16 and SIE10, against 1.5–1.7 s elsewhere and
+   about 1.6–1.7 s expected for blood. It points to partial volume or a $T_1$ bias, which are scale
+   errors.
 
 ---
 
@@ -110,7 +124,8 @@ alone is not an error. No noise. Changes are relative to the fit with the true A
   higher late tail gives −15%.
 
 So for subtle-leakage $K^{\text{trans}}$, the priority order is: **scale ≈ peak-to-tail and tail
-shape ≫ timing ≈ arterial vs venous.**
+shape ≫ timing ≈ arterial vs venous.** This is for an 8-min scan. With the cohort's 16-min scans, peak
+errors drop out and the order becomes **scale ≈ tail shape ≫ the rest** (§3.6).
 
 ### 3.5 Why low-leakage Ktrans is so sensitive: vp leverage
 
@@ -129,6 +144,30 @@ low-leakage brain is almost all $v_p\, c(t)$. $K^{\text{trans}}$ is a small slop
 so any part of the AIF error that the fit cannot absorb into $v_p$ gets amplified into
 $K^{\text{trans}}$ by $v_p/K$. Longer scans reduce the leverage by giving the integral term more
 weight.
+
+### 3.6 The cohort's protocols
+
+The same brain case (Patlak, delay fitted), rerun with each protocol's frame duration and scan length
+(`python3 docs/sims/aif_error_ktrans.py --protocols`; 64 frames, arrival 40–46 s). The cell is
+$\Delta K^{\text{trans}}$, with the single-voxel fit residual in % of the tissue peak in brackets.
+
+| Protocol | Scan | Scale ×0.8 | First-pass −30% | Peak saturation | Venous-like | Washout +30% | Tail +10% | $\rho$, saturation (min⁻¹) |
+|---|---|---|---|---|---|---|---|---|
+| SIE08 (CCIR) | 8.4 min | +25% (0.01) | **−29%** (2.2) | **−18%** (1.6) | −11% (3.1) | **+35%** (0.11) | −14% (0.37) | −0.022 |
+| SIE10 | 10.5 min | +25% (0.04) | −17% (2.7) | −8% (1.6) | −7% (3.9) | **+35%** (0.16) | −12% (0.49) | −0.014 |
+| GE10 (BANNER) | 11.3 min | +25% (0.03) | −14% (2.6) | −7% (1.6) | −3% (2.2) | **+34%** (0.16) | −11% (0.48) | −0.012 |
+| SIE16 | 16.4 min | +25% (0.03) | −5% (2.7) | −0.6% (1.6) | −1.5% (4.3) | **+32%** (0.29) | −9% (0.54) | −0.007 |
+| GE16 | 16.6 min | +25% (0.02) | −5% (2.6) | −0.5% (1.6) | −2.5% (5.3) | **+32%** (0.29) | −9% (0.52) | −0.007 |
+
+- **The PI's intuition holds for the 16-min protocols**, about 60% of sessions: peak errors move brain
+  $K^{\text{trans}}$ by under 5%, and arterial vs venous by under 3%.
+- **It does not hold for the 8.4-min CCIR protocol**, where peak errors still move $K^{\text{trans}}$
+  by 18–29%. Mid-length scans sit in between. Peak handling therefore differs by site, which is itself
+  a site effect in $K^{\text{trans}}$.
+- **Scale, washout and tail level matter at every site.** They are the priority everywhere.
+- This is a protocol difference in the *leverage* $\rho$, so a pooled ComBat-style correction has to
+  model it per protocol (§6.1). It also bounds how much a cross-site difference in
+  $K^{\text{trans}}$ can come from AIF peak handling.
 
 ---
 
@@ -264,7 +303,21 @@ added by it. In the simulation, the floor set by venous delay and dispersion is
 $\lvert\hat K_{\text{vessel}}\rvert \le 0.008\ \text{min}^{-1}$ with the correct AIF, against
 $-0.031\ \text{min}^{-1}$ for a 30% peak saturation. **The probe vessel must not be the voxels that
 built the AIF**, because fitting an AIF to its own curve returns $\rho = 0$ trivially. Use a
-different vessel (sagittal sinus vs an arterial AIF, or the reverse), or a held-out segment.
+different vessel, or a held-out segment.
+
+**Which probe vessel, in this cohort.** The coronal slabs reach the top of the brain, so the superior
+sagittal sinus (SSS) and the jugular veins are both in view. Most AIF masks are arterial, so both veins
+are independent probes. The two differ in inflow:
+
+- **Jugular, preferred.** It runs in-plane, so it has little inflow effect. Use it for $\rho$ and as the
+  late-blood scale anchor.
+- **SSS, secondary.** It runs through-plane, so fresh unsaturated spins raise its signal. That breaks the
+  $T_1$-based signal-to-concentration conversion in a flow-dependent way. The ratio
+  $\hat K/\hat v_p$ cancels partial volume but not this nonlinearity. Agreement between the jugular
+  and the SSS estimates of $\rho$ is a check on inflow.
+
+In the few sessions whose AIF mask is jugular, probe with the SSS or with arterial voxels outside the
+mask.
 
 **(b) Tissue $K$–$v_p$ slope: a biological anchor.** Across tissue voxels,
 $\hat K_v = m_{22}K_v + m_{21}v_{p,v}$, so regressing $\hat K$ on $\hat v_p$ gives
@@ -277,14 +330,90 @@ and they assume the very quantity a study might be measuring.
 
 ### 5.6 Relation to existing work
 
-The idea that tissue curves determine the AIF is **multichannel blind identification**
-(Riabkov & Di Bella 2002; Fluckiger et al. 2009; Schabel et al. 2010). Those papers show the AIF is
-recoverable from multiple tissue curves *up to scale*, which matches §5.3. §5.3 adds that for
-low-leakage Patlak there is a second near-blind direction, and that it is exactly the one that
-moves $K^{\text{trans}}$. Low-level BBB leakage work commonly uses a sagittal sinus input
+The idea that tissue curves determine the AIF is **multichannel blind identification**, or simultaneous
+estimation (SIME) in PET (Riabkov & Di Bella 2002; Wang et al. 2004; Fluckiger et al. 2009;
+Schabel et al. 2010; Zhu et al. 2024). Those papers show the AIF is recoverable from multiple tissue
+curves *up to scale*, which matches §5.3. §5.3 adds that for low-leakage Patlak there is a second
+near-blind direction, and that it is exactly the one that moves $K^{\text{trans}}$. §5.7 explains why,
+using the literature's own identifiability condition. Low-level BBB leakage work commonly uses a sagittal sinus input
 function, partly because it suffers less partial volume (for example Heye et al. 2016; Manning et
 al. 2021). The $\rho$
 check in §5.5(a) extends it from scale to shape.
+
+### 5.7 What the blind-estimation papers add
+
+Read for this plan: Riabkov & Di Bella 2002 (IEEE TBME), Wang et al. 2004 (ISBI), Fluckiger et al. 2009
+(MRM), Zhu et al. 2024 (NeuroImage).
+
+**1. Scale is never identifiable from tissue, and everyone fixes it with late blood.** Riabkov pins
+the last two AIF points to measured blood. Fluckiger matches the mean of the last five points to a
+nearby artery. Zhu scales the last point to a reference. The reason given each time is that late
+concentrations are low, so saturation is small, and that a big vessel can be chosen for low partial
+volume. This supports §6.2, with the **jugular tail** as the natural late-blood anchor in this cohort:
+it is a large vessel with little inflow effect (§5.5), and the anchor is read where saturation is
+least.
+
+**2. Identifiability needs channels with different kinetics.** Riabkov's uniqueness proof requires
+that the tissue transfer functions share no poles, meaning distinct $k_{ep}$. Zhu needs at least three
+regions "of distinct shapes". Low-leakage brain under Patlak breaks this condition: every voxel has
+$k_{ep} = 0$, so all tissue curves lie in $\operatorname{span}\{c, \int c\}$. Adding
+$\Delta = \varepsilon \int c$ to the AIF changes the fit only in a residual term proportional to
+$\varepsilon K$, which is tiny when $K$ is. **This is why the $\rho$ direction of §5.3 is near-blind
+in brain, however many brain voxels are pooled.** Channels with $k_{ep} > 0$ restore it. The new check
+in [the simulation](sims/aif_error_ktrans.py) adds a ramp $\propto \int c$ (pooled over 200 brain
+voxels and 50 extracranial voxels; noise-free):
+
+| Ramp at 4 min | Brain median $\Delta K^{\text{trans}}$ | Pooled brain residual (Patlak) | Pooled extracranial residual (ext. Tofts) |
+|---|---|---|---|
+| +5% | −0.0003 min⁻¹ (−15%) | 0.045 → 0.096% | 0.53 → 0.52% |
+| +10% | −0.0006 min⁻¹ (−28%) | 0.045 → 0.145% | 0.53 → 0.87% |
+| +20% | −0.0011 min⁻¹ (−55%) | 0.045 → 0.221% | 0.53 → 1.80% |
+
+The extracranial residual rises 3–7 times more than the brain residual once the error is 10% or more.
+Below that it is lost in the simulation's own discretization floor (0.53%), so this is only a lower
+bound on what real noise allows. **Extracranial tissue with $k_{ep} > 0$** (temporalis muscle, scalp),
+plus choroid plexus and any lesion, is the tissue that can see the error that moves brain
+$K^{\text{trans}}$. In this cohort that tissue is in `desc-hmc_DCE` but masked out of the concentration
+data (data_inventory §3).
+
+**3. Tissue-fit quality does not rank AIFs, on independent evidence.** In Zhu et al., the carotid
+image-derived input gave errors of 101% in $K_1$ and 186% in $v_b$, yet "all the methods were able to
+fit the tissue TACs well". In Fluckiger et al., the dispersed, delayed input estimated from tissue alone
+fits tissue *better* than the measured arterial one. A residual-based ranking therefore leans toward
+local, dispersed input functions. This agrees with §5.3–5.4: use the residual as a detector of gross
+and peak problems, not as the selection criterion.
+
+**4. Constrain the AIF shape; a linear kernel form is best.** Without a shape model the blind AIF is
+noisier than the tissue (Fluckiger), and nonlinear parametric forms fail to converge (Zhu, supplement).
+Zhu's **kernel SIME** writes the AIF as $c = \mathbf K\alpha$. $\mathbf K$ is a Gaussian kernel matrix
+built from features of an image-derived curve, and the AIF is linear in $\alpha$. It corrected a
+partial-volumed carotid input to an MAE of 7–16% in kinetic parameters, against 37–101% for the raw
+carotid curve. **AutoAIF's curve is exactly such an image-derived prior.** Kernel SIME on AutoAIF
+features is a candidate correction method (§6.3) that uses the tissue to fix shape, including the peak
+for short protocols. It still needs channels with distinct kinetics (point 2) and a late-blood scale
+(point 1).
+
+**5. Variable projection makes the whole-brain criterion cheap.** For fixed AIF and $k_{ep}$, the
+per-voxel amplitudes are linear and can be profiled out. Riabkov's IQML and Wang's ML both reduce the
+cost to
+
+$$
+L(\theta) = \operatorname{Tr}\{(\mathbb I - \mathbf P_{A(\theta)})\,\hat{\mathbf R}\},
+\qquad \hat{\mathbf R} = \tfrac1N \textstyle\sum_v y_v y_v^\top
+$$
+
+Here $A(\theta)$ holds the AIF and its kinetic transforms. $\hat{\mathbf R}$ is a 64×64 matrix
+computed once per region, so §5.2's $R(\tilde c)$ over all voxels costs a 64×64 projection per
+candidate. The eigenvalues of $\hat{\mathbf R}$ also show the signal-subspace dimension, which is 2 for
+pure Patlak. That makes it a model check for whether Patlak is adequate in a region.
+
+**6. Practical details worth copying.**
+- Fluckiger reduces voxels to about 8 k-means cluster means before fitting, for SNR. Results were stable
+  for 4–10 clusters.
+- Use a single global delay found by grid search (Zhu, Fluckiger).
+- Initialize from a population AIF. Fluckiger's alternating method was robust (median 8% parameter error)
+  from near-truth or zero starts, but poor at bound-valued starts. Our site prior (§6.1) is the right
+  initializer.
 
 ---
 
@@ -330,8 +459,8 @@ Scale cannot be read from tissue fits (§5.3). It needs absolute anchors. Take t
 measurements per subject with independent errors, for example:
 
 - $X_1$: AutoAIF tail level;
-- $X_2$: $\hat v_p$ of the least-partial-volumed probe vessel voxels (sinus maximum), converted so
-  that a pure vessel reads 1;
+- $X_2$: $\hat v_p$ of the least-partial-volumed probe vessel voxels (jugular maximum, which has less
+  inflow than the SSS), converted so that a pure vessel reads 1;
 - $X_3$: plasma level predicted from dose per kg and a population biexponential (Weinmann 1984),
   optionally adjusted for hematocrit and renal function.
 
@@ -348,7 +477,8 @@ combined amplitude weights each $X_k$ by $1/\operatorname{Var}(e_k)$. That is th
 shrinkage for scale, with weights estimated rather than assumed. This is the review's
 tissue-regression idea (§3, item 1) made general.
 
-**Circularity rule:** anything used as an anchor cannot be an outcome. Physical anchors (vessel
+**Circularity rule:** anything used as an anchor cannot be an outcome. White-matter $v_p$ has not
+been an outcome in this cohort (PI, 2026-11-24), so it can be a fourth amplitude measure $X_4$ here. Physical anchors (vessel
 lumen, dose pharmacokinetics) come first. A white-matter $v_p$ anchor would partly normalize away
 real differences in white-matter $v_p$ between groups, so use it only when that is not a study
 question.
@@ -356,7 +486,8 @@ question.
 ### 6.3 Candidate AIFs: the PI's voxel-selection idea, re-aimed
 
 Generate candidate AIFs from the network ranking: top-$N$ for several $N$, connected components
-separately, artery vs sinus, and the site population AIF. Rank them by:
+separately, artery vs sinus, the site population AIF, and a **kernel-SIME correction of the AutoAIF
+curve** (§5.7 point 4) fitted to brain and extracranial channels. Rank them by:
 
 1. $\lvert\hat\rho\rvert$ against an independent probe vessel (§5.5a). This is the
    $K^{\text{trans}}$-relevant criterion.
@@ -385,12 +516,12 @@ corrections. It has no feedback loop and is useful whatever happens to the rest.
 
 | Gate | Work | Needs | Stop or redirect if |
 |---|---|---|---|
-| **0** | Prerequisites in §2: baseline estimator, fix main_vif.py:93, native-frame curves, concentration conversion, Patlak fitting (ROCKETSHIP or Python) | code only | n/a |
-| **1** | Re-run [the simulation](sims/aif_error_ktrans.py) with each site's real frame times, scan length, dose, and typical $v_p$, $K^{\text{trans}}$. Add realistic $T_1$ saturation for each site's sequence | protocol parameters, no subject data | Leverage $v_p/K$ is small at all sites: shape errors don't matter; go to Gate 3 only |
-| **2** | Measure $\hat\rho_j$ on the cohort: fit probe vessel voxels (not in the AIF mask) with each subject's AutoAIF AIF. Report the implied offset $\hat\rho_j \cdot \bar v_p$ against the between-subject SD of $K^{\text{trans}}$. Cross-check with the tissue $K$–$v_p$ slope (§5.5b) | AutoAIF outputs, probe-vessel masks, Patlak maps | Implied offset under about 10% of between-subject $K^{\text{trans}}$ SD: leverage error is not a problem |
-| **3** | Scale: triple collocation (§6.2) gives the error variance of AutoAIF amplitude per site | dose, weight, sinus voxels, optionally Hct | AutoAIF amplitude error variance is small next to biological spread |
+| **0** | Prerequisites in §2. Done: baseline estimator identified, native frames confirmed, bug fix in PR #12. Left: decide pre- or post-fix masks for the baseline; choose fitted vs raw AIF; a Python Patlak refit that reproduces ROCKETSHIP's Ktrans on `smoke` | code; case list `smoke` | Refit does not reproduce ROCKETSHIP within noise: fix that first |
+| **1** | Done for frame time and scan length (§3.6). Left: realistic $T_1$ saturation per protocol (FA 15°, each TR, 3.4 vs 5.7 relaxivity), each protocol's dose, and typical $v_p$, $K^{\text{trans}}$ from the standard derivative | protocol parameters; GM/WM medians from `dceprep-multihance_fix` | Leverage small at all sites: shape errors don't matter; go to Gate 3 only. Already true for peak errors at the 16-min sites |
+| **2** | Measure $\hat\rho_j$ on the cohort: fit probe vessel voxels (not in the AIF mask) with each subject's AutoAIF AIF. Report the implied offset $\hat\rho_j \cdot \bar v_p$ against the between-subject SD of $K^{\text{trans}}$. Cross-check with the tissue $K$–$v_p$ slope (§5.5b) and with the extracranial multichannel residual (§5.7 point 2). Run on `small`, then `medium`, then `analyzable` | AutoAIF outputs, probe-vessel masks, Patlak maps, `desc-hmc_DCE` + unmasked VFAs for extracranial ROIs | Implied offset under about 10% of between-subject $K^{\text{trans}}$ SD: leverage error is not a problem |
+| **3** | Scale: triple collocation (§6.2) gives the error variance of AutoAIF amplitude per site | dose, weight, jugular voxels (SSS as a check), optionally Hct | AutoAIF amplitude error variance is small next to biological spread |
 | **4** | Tissue residual as a detector: corrupt real AIFs deliberately (saturation, tail ramp, delay, scale) and check that paired $\Delta R$ ranks them as §5.3–5.4 predicts | Gate 0 pipeline | It does not detect peak distortions on real data: drop it from candidate ranking |
-| **5** | Correction: EB-shrunk $\rho^{\ast}_j$, scale calibration, candidate selection. Evaluate on $K^{\text{trans}}$ test–retest and against two baselines: uncorrected AutoAIF, and the site population AIF. Check that a known group difference is preserved | repeat sessions | It does not beat **both** baselines |
+| **5** | Correction: EB-shrunk $\rho^{\ast}_j$, scale calibration, candidate selection (including kernel SIME). Evaluate on $K^{\text{trans}}$ test–retest and against two baselines: uncorrected AutoAIF, and the site population AIF. Check that a known group difference is preserved. Use the 97 cross-site subjects to test that site differences shrink | case list `repeat` (187 subjects; within-site repeats at USCINI, USCSTEVENS, BANNER; none at CCIR) | It does not beat **both** baselines |
 
 Gates 1–3 are measurement, not method development, and each can end the project cheaply.
 
@@ -403,15 +534,29 @@ discrimination, first-pass recovery for flow, the forward model for undersampled
 
 ## 9. Open questions
 
-1. Are the manual masks arterial, sinus, or mixed by site? (decides probe-vessel independence, §5.5)
-2. Which AIF goes downstream today: soft-weighted curve or top-20 native mask?
-3. Which kinetic fitting code and model are used on this cohort: ROCKETSHIP Patlak? Fitted delay?
-4. Per site: frame duration, scan length, dose, flip angle and TR (Gate 1), and whether $T_{10}$
-   maps exist.
-5. Is the sagittal sinus in the field of view at every site? Is an artery?
-6. How many subjects have repeat sessions, per site? (Gate 5)
-7. Are hematocrit, weight and eGFR recorded? (scale anchor $X_3$)
-8. Is white-matter $v_p$ ever an outcome? (decides whether it can be an anchor, §6.2)
+Status after the data inventory ([data_inventory.md](data_inventory.md)):
+
+1. **Answered (PI).** Manual masks are mostly arterial; a few are venous, usually the jugular. A
+   per-session label still needs a look at the 118 masks, to find the venous ones.
+2. **Answered.** Downstream uses the mean of the 20 top-voxel mask voxels on native frames, fitted to
+   ROCKETSHIP's 4-parameter AIF model (§2 item 1). The soft mask is unused.
+3. **Answered.** ROCKETSHIP (MATLAB, Gpufit), Patlak, voxel-wise, no delay fit, no smoothing,
+   Hct 0.45, first frame dropped, automatic baseline and injection detection.
+4. **Mostly answered.** Five protocol groups (data_inventory §2.1): FA 15°, frames 7.9–15.6 s,
+   8.4–16.6 min, VFA $T_{10}$ maps with 5 flips (3 at GE16). Left: dose per site; the agent can only be
+   inferred from relaxivity (5.7 MultiHance in 108 sessions, 3.4 otherwise).
+5. **Answered (PI).** The coronal slabs cover to the top of the brain. The SSS is visible near the top
+   (through-plane, strong inflow) and the jugular veins are visible (in-plane, less inflow). Arteries
+   are in view; most AIF masks are arterial. Consequences: §5.5 probe choice.
+6. **Answered.** 187 subjects have 2–5 sessions. Within-site repeats: USCINI 36 subjects, USCSTEVENS 10,
+   BANNER 43, CCIR 0. 97 subjects have sessions at two or more sites.
+7. **Answered.** Weight: yes, every session. Hematocrit and eGFR: no. Dose: not recorded.
+8. **Answered (PI).** White-matter $v_p$ has not been an outcome, so it can serve as an extra scale
+   anchor ($X_4$ in §6.2) for current studies. Revisit if a study makes it an outcome.
+9. **Settled.** The pre-contrast window ends around frame 2. The "image 18" values in about 340 logs
+   are a printing artifact of the detector (§2 item 6).
+10. **Open.** Should the baseline for this project use the pre-fix (top-20 always) or post-fix
+    (PR #12) AutoAIF masks?
 
 ---
 
@@ -537,7 +682,8 @@ posterior-variance term.
 
 ## References
 
-Citations are from memory. Check volume and page details before reusing them in a manuscript.
+Citations are from memory except Riabkov 2002, Fluckiger 2009, Wang 2004 and Zhu 2024, which were
+checked against the PDFs (Drive folder `claude/AIF`). Check details before reusing them in a manuscript.
 
 - Barnes SR et al. ROCKETSHIP: a flexible and modular software tool for the planning, processing
   and analysis of dynamic MRI studies. *BMC Med Imaging* 2015;15:19.
@@ -576,5 +722,10 @@ Citations are from memory. Check volume and page details before reusing them in 
   triple collocation. *J Geophys Res* 1998;103:7755–7766.
 - Tofts PS et al. Estimating kinetic parameters from dynamic contrast-enhanced T1-weighted MRI of
   a diffusable tracer: standardized quantities and symbols. *JMRI* 1999;10:223–232.
+- Wang ZJ, Han Z, Liu KJR, Wang Y. Simultaneous estimation of kinetic parameters and the input
+  function from DCE-MRI data: theory and simulation. *Proc. IEEE ISBI* 2004:996–999.
 - Weinmann HJ, Laniado M, Mützel W. Pharmacokinetics of GdDTPA/dimeglumine after intravenous
   injection into healthy volunteers. *Physiol Chem Phys Med NMR* 1984;16:167–172.
+- Zhu Y, Tran Q, Wang Y, Badawi RD, Cherry SR, Qi J, Abbaszadeh S, Wang G. Optimization-derived
+  blood input function using a kernel method and its evaluation with total-body PET for brain
+  parametric imaging. *NeuroImage* 2024;293:120611.

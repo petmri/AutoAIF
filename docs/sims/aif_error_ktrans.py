@@ -1,17 +1,31 @@
 """Noise-free simulation: how AIF errors propagate into Patlak / extended Tofts parameters.
 
-Produces every number quoted in docs/population_aif_shrinkage.md (v2), sections 3-5.
+Produces every number quoted in docs/population_aif_shrinkage.md, sections 3-5.
 Synthetic data only (Parker population AIF); reads no files. numpy only.
 
-    python3 docs/sims/aif_error_ktrans.py
+    python3 docs/sims/aif_error_ktrans.py                  # v2 setting: 15 s x 32 frames, arrival 60 s
+    python3 docs/sims/aif_error_ktrans.py --protocols      # brief table for the cohort's five protocols
+    python3 docs/sims/aif_error_ktrans.py --frame 7.9 --nframes 64 --arrival 40
 """
+import argparse
+import subprocess
+import sys
+
 import numpy as np
 
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--frame", type=float, default=15.0, help="frame duration, s")
+_ap.add_argument("--nframes", type=int, default=32)
+_ap.add_argument("--arrival", type=float, default=60.0, help="bolus arrival, s")
+_ap.add_argument("--brief", action="store_true", help="one line per AIF error, brain Patlak only")
+_ap.add_argument("--protocols", action="store_true", help="run --brief for each cohort protocol")
+_ARGS, _ = _ap.parse_known_args()
+
 # ---------------------------------------------------------------- setup
-DT = 0.1            # s, fine grid for the "true" continuous curves
-T_TOTAL = 480.0     # s, scan length (32 frames x 15 s)
-T_ARRIVAL = 60.0    # s, bolus arrival
-FRAME = 15.0        # s, temporal resolution
+FRAME = _ARGS.frame                 # s, temporal resolution
+DT = FRAME / 150                    # s, fine grid for the "true" continuous curves (0.1 s at 15 s frames)
+T_TOTAL = FRAME * _ARGS.nframes     # s, scan length
+T_ARRIVAL = _ARGS.arrival           # s, bolus arrival
 HCT = 0.42
 
 t = np.arange(0, T_TOTAL, DT)
@@ -123,6 +137,66 @@ ERRORS = {
 AIF = {k: to_frames(v) for k, v in ERRORS.items()}
 
 
+# cohort protocols (docs/data_inventory.md): name, frame s, frames, arrival s
+PROTOCOLS = [("SIE08", 7.90, 64, 40), ("SIE10", 9.81, 64, 40), ("GE10", 10.62, 64, 40),
+             ("SIE16", 15.36, 64, 46), ("GE16", 15.58, 64, 46)]
+BRIEF_ERRORS = ["scale x0.8 (partial volume, S0, T10, Hct)", "first-pass area -30%",
+                "peak saturation (peak -30%, nonlinear)", "venous-like (4 s delay + 4 s dispersion)",
+                "washout rate +30%", "tail level +10% (>2 min after arrival)"]
+
+
+def brief():
+    """Brain Patlak (delay fitted): dK% and residual for the main errors, plus rho for saturation."""
+    ct = to_frames(tissue(0.002, 0.02))
+    fit = with_delay(fit_patlak)
+    K0, _, _ = fit(ct, AIF["true AIF"])
+    cells = []
+    for k in BRIEF_ERRORS:
+        K, _, r = fit(ct, AIF[k])
+        cells.append(f"{100 * (K / K0 - 1):+6.1f}% ({100 * r / ct.max():.2f})")
+    c0 = AIF["true AIF"]
+    Xtrue = np.c_[c0, cumtrapz(c0)]
+    Xt = np.c_[AIF[BRIEF_ERRORS[2]], cumtrapz(AIF[BRIEF_ERRORS[2]])]
+    M = np.linalg.solve(Xt.T @ Xt, Xt.T @ Xtrue)
+    rho = M[1, 0] * 60 / M[0, 0]
+    return cells, rho
+
+
+def multichannel():
+    """Does pooling voxels reveal the tail-ramp error? Brain (Patlak, kep = 0) vs extracranial (kep > 0)."""
+    rng = np.random.default_rng(1)
+    brain = [to_frames(tissue(K, v)) for K, v in zip(rng.uniform(0, 0.004, 200), rng.uniform(0.01, 0.06, 200))]
+    ext = [to_frames(tissue(K, v, kep=K / ve)) for K, v, ve in
+           zip(rng.uniform(0.05, 0.15, 50), rng.uniform(0.02, 0.05, 50), rng.uniform(0.1, 0.3, 50))]
+    c0 = AIF["true AIF"]
+    I0 = cumtrapz(c0)
+    i4 = np.argmin(abs(tf - T_ARRIVAL - 240))
+
+    def pooled(ca, sets, fit):
+        return 100 * np.sqrt(np.mean([(fit(ct, ca)[2] / ct.max()) ** 2 for ct in sets]))
+
+    print("\nMultichannel check: AIF + ramp proportional to its running integral (the rho direction)")
+    print(f"{'ramp at 4 min':>14s} | {'brain median dK (1/min)':>24s} | {'pooled resid %, brain Patlak':>29s} | "
+          f"{'pooled resid %, extracranial eTofts':>36s}")
+    base_b, base_e = pooled(c0, brain, fit_patlak), pooled(c0, ext, fit_etofts)
+    for pct in (5, 10, 20):
+        ca = c0 + I0 * (pct / 100 * c0[i4] / I0[i4])
+        dK = np.median([fit_patlak(ct, ca)[0] - fit_patlak(ct, c0)[0] for ct in brain])
+        print(f"{'+' + str(pct) + '%':>14s} | {dK:+24.5f} | {base_b:13.3f} -> {pooled(ca, brain, fit_patlak):6.3f}"
+              f"{'':9s}| {base_e:13.3f} -> {pooled(ca, ext, fit_etofts):6.3f}")
+
+
+def protocols():
+    print("Brain Patlak, delay fitted. Cell: dK% (single-voxel fit residual, % of tissue peak). "
+          "rho for 30% peak saturation in 1/min.")
+    print(f"{'protocol':9s} {'scan':>6s} | " + " | ".join(f"{e.split(' (')[0][:16]:>16s}" for e in BRIEF_ERRORS)
+          + " | rho_sat")
+    for name, fr, n, arr in PROTOCOLS:
+        out = subprocess.check_output([sys.executable, __file__, "--brief", "--frame", str(fr),
+                                       "--nframes", str(n), "--arrival", str(arr)], text=True)
+        print(f"{name:9s} {fr * n / 60:5.1f}m | {out.strip()}")
+
+
 def main():
     print(f"plasma AIF peak: {peak:.2f} mM fine grid, {AIF['true AIF'].max():.2f} mM at 15 s frames")
     print(f"first-pass area / AUC over scan: {first_pass.sum() * DT / I_fine[-1]:.2f}\n")
@@ -197,4 +271,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if _ARGS.protocols:
+        protocols()
+    elif _ARGS.brief:
+        cells, rho = brief()
+        print(" | ".join(f"{c:>16s}" for c in cells) + f" | {rho:+.4f}")
+    else:
+        main()
+        multichannel()
